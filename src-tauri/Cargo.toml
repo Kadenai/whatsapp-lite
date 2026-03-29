@@ -1,0 +1,32 @@
+[package]
+name = "WhatsAppLite"
+version = "1.0.0"
+description = "WhatsApp Desktop Ultra-Light"
+authors = ["Levi Raniere"]
+edition = "2021"
+
+[lib]
+name = "whatsapp_lite_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-dialog = "2.6.0"
+tauri-plugin-fs = "2.4.5"
+tauri-plugin-notification = "2"
+tauri-winrt-notification = "0.7.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

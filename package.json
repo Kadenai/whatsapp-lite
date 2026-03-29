@@ -1,0 +1,16 @@
+{
+  "name": "whatsapp-lite",
+  "private": true,
+  "version": "1.0.0",
+  "author": "Levi Raniere",
+  "type": "module",
+  "scripts": {
+    "verify:no-right-click": "node scripts/verify-no-right-click.js",
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
