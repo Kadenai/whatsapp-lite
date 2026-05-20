@@ -8,21 +8,6 @@
   },
   "app": {
     "withGlobalTauri": false,
-    "windows": [
-      {
-        "title": "WhatsAppLite",
-        "label": "main",
-        "width": 1100,
-        "height": 720,
-        "minWidth": 780,
-        "minHeight": 480,
-        "center": true,
-        "decorations": true,
-        "resizable": true,
-        "dragDropEnabled": false,
-        "url": "https://web.whatsapp.com"
-      }
-    ],
     "security": {
       "csp": null
     }

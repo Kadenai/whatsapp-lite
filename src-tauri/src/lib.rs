@@ -2,7 +2,7 @@ use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, CheckMenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent,
+    Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_dialog::DialogExt;
@@ -76,18 +76,129 @@ fn focus_main_window(app: tauri::AppHandle) {
     }
 }
 
+/// Monta o XML do toast manualmente, cria uma `ToastNotification`, seta `Tag` e
+/// `Group` (que o wrapper `tauri-winrt-notification` 0.7.2 só expõe pra toasts
+/// de progresso) e registra o handler de Activated com bridge pra JS. Tag+Group
+/// é o que faz o Windows substituir a toast anterior do mesmo chat em vez de
+/// empilhar — limite de 64 chars cada (Win10 1903+).
+#[cfg(target_os = "windows")]
+fn show_chat_toast(
+    app: &tauri::AppHandle,
+    app_id: &str,
+    title: &str,
+    body: &str,
+    avatar_path: Option<&std::path::Path>,
+    tag: &str,
+    click_id: String,
+) -> Result<(), String> {
+    use windows::{
+        core::{IInspectable, HSTRING},
+        Data::Xml::Dom::XmlDocument,
+        Foundation::TypedEventHandler,
+        UI::Notifications::{ToastNotification, ToastNotificationManager},
+    };
+
+    fn xml_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&apos;"),
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    let image_xml = match avatar_path {
+        Some(p) => format!(
+            r#"<image placement="appLogoOverride" hint-crop="circle" src="file:///{}" alt="avatar" />"#,
+            xml_escape(&p.display().to_string()),
+        ),
+        None => String::new(),
+    };
+
+    let xml = format!(
+        r#"<toast duration="short"><visual><binding template="ToastGeneric">{image}<text>{title}</text><text>{body}</text></binding></visual></toast>"#,
+        image = image_xml,
+        title = xml_escape(title),
+        body = xml_escape(body),
+    );
+
+    let xml_doc = XmlDocument::new().map_err(|e| format!("XmlDocument::new: {e}"))?;
+    xml_doc
+        .LoadXml(&HSTRING::from(xml.as_str()))
+        .map_err(|e| format!("LoadXml: {e}"))?;
+
+    let toast = ToastNotification::CreateToastNotification(&xml_doc)
+        .map_err(|e| format!("CreateToastNotification: {e}"))?;
+
+    if !tag.is_empty() {
+        let tag_sanitized: String = tag
+            .chars()
+            .filter(|c| !c.is_control() && !c.is_whitespace())
+            .take(64)
+            .collect();
+        if !tag_sanitized.is_empty() {
+            toast
+                .SetTag(&HSTRING::from(tag_sanitized.as_str()))
+                .map_err(|e| format!("SetTag: {e}"))?;
+            toast
+                .SetGroup(&HSTRING::from("wa-lite"))
+                .map_err(|e| format!("SetGroup: {e}"))?;
+        }
+    }
+
+    let app_handle = app.clone();
+    let handler = TypedEventHandler::<ToastNotification, IInspectable>::new(
+        move |_sender, _args| {
+            if let Some(win) = app_handle.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+                if !click_id.is_empty() {
+                    let escaped = click_id
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"");
+                    let js = format!(
+                        "window.__waLiteOnNotifClick && window.__waLiteOnNotifClick(\"{}\");",
+                        escaped
+                    );
+                    let _ = win.eval(&js);
+                }
+            }
+            Ok(())
+        },
+    );
+
+    toast
+        .Activated(&handler)
+        .map_err(|e| format!("Activated: {e}"))?;
+
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id))
+        .map_err(|e| format!("CreateToastNotifierWithId: {e}"))?;
+    notifier
+        .Show(&toast)
+        .map_err(|e| format!("Show: {e}"))?;
+
+    Ok(())
+}
+
 #[tauri::command]
 fn send_notification(
     app: tauri::AppHandle,
     title: String,
     body: String,
+    image_bytes: Option<Vec<u8>>,
+    notification_id: Option<String>,
+    tag: Option<String>,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use tauri_winrt_notification::{Duration, Toast};
-
         let app_id = app.config().identifier.clone();
-        let app_handle = app.clone();
 
         let clean_title = {
             let t = title.trim();
@@ -107,73 +218,88 @@ fn send_notification(
             }
         };
 
-        let toast = Toast::new(&app_id)
-            .title(&clean_title)
-            .text1("")
-            .text2(&clean_body)
-            .duration(Duration::Short)
-            .on_activated(move |_| {
-                if let Some(win) = app_handle.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.unminimize();
-                    let _ = win.set_focus();
+        let notif_id = notification_id.unwrap_or_default();
+        let tag_str = tag.unwrap_or_default();
+
+        // Avatar: chaveia o arquivo temp pelo tag (chat id) quando existe — mesma
+        // pessoa = mesmo arquivo, sem proliferação. Fallback pro notif_id quando
+        // não tem tag (notificações sem chat associado).
+        let avatar_path: Option<std::path::PathBuf> = match image_bytes {
+            Some(bytes) if !bytes.is_empty() => {
+                let key: &str = if !tag_str.is_empty() {
+                    &tag_str
+                } else {
+                    &notif_id
+                };
+                let safe_key: String = key
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .take(64)
+                    .collect();
+                let filename = if safe_key.is_empty() {
+                    "wa_lite_avatar.png".to_string()
+                } else {
+                    format!("wa_lite_avatar_{}.png", safe_key)
+                };
+                let mut path = std::env::temp_dir();
+                path.push(filename);
+                match OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .and_then(|mut f| f.write_all(&bytes))
+                {
+                    Ok(_) => Some(path),
+                    Err(_) => None,
                 }
-                Ok(())
-            });
+            }
+            _ => None,
+        };
 
-        toast
-            .show()
-            .map_err(|e| format!("Falha ao enviar notificação: {e}"))?;
-
-        return Ok(());
+        return show_chat_toast(
+            &app,
+            &app_id,
+            &clean_title,
+            &clean_body,
+            avatar_path.as_deref(),
+            &tag_str,
+            notif_id,
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-    app.notification()
-        .builder()
-        .id(1) // ID fixo para substituir sempre a notificação anterior
-        .title(&title)
-        .body(&body)
-        .show()
-        .map_err(|e| format!("Falha ao enviar notificação: {e}"))
+        let _ = (image_bytes, notification_id, tag);
+        app.notification()
+            .builder()
+            .id(1)
+            .title(&title)
+            .body(&body)
+            .show()
+            .map_err(|e| format!("Falha ao enviar notificação: {e}"))
     }
 }
 
-#[tauri::command]
-fn is_window_visible(app: tauri::AppHandle) -> Result<bool, String> {
-    let win = app.get_webview_window("main")
-        .ok_or_else(|| "Janela principal nao encontrada".to_string())?;
-    let visible = win.is_visible().unwrap_or(true);
-    let focused = win.is_focused().unwrap_or(false);
-    let minimized = win.is_minimized().unwrap_or(false);
-    // Janela esta "ativa" se esta visivel, nao minimizada, e com foco
-    Ok(visible && !minimized && focused)
-}
-
-/// JavaScript injetado para:
-/// 1. Ctrl+W fecha conversa (Escape)
-/// 2. Ctrl+Seta para cima edita a última mensagem enviada
-/// 3. Dialogo nativo para salvar downloads e abertura segura de links externos
-/// 4. Remocao do banner de instalacao no rodape da sidebar (lista de conversas)
-///
-/// Escopo de manutenção:
-/// - Não adicionar automações de clique direito/context menu no WebView.
-/// - O clique direito da tray permanece permitido por design (menu do sistema).
+/// JavaScript injetado em document_start na WebView, antes do bundle do
+/// WhatsApp Web rodar. Responsável por:
+/// 1. Proxy do `Notification`: WhatsApp Web chama `new Notification(...)` e a
+///    chamada é forwardada para o toast nativo (`tauri-winrt-notification`),
+///    com avatar do contato, branding "WhatsApp Lite" e bridge de click que
+///    dispara o `onclick` original (abre a conversa certa, não só foca janela).
+///    Toda a lógica de quando notificar (mute, foco da janela, preview ligado,
+///    canais, status) fica com o próprio WhatsApp Web.
+/// 2. Atalhos: Ctrl+W (Escape) e Ctrl+Seta-pra-cima (editar última mensagem).
+/// 3. Diálogo nativo para salvar downloads.
+/// 4. Abertura segura de links externos no navegador do sistema.
+/// 5. Defesa em camadas (com o guard `on_navigation`) contra navegação
+///    programática externa via `window.open` / `location.assign|replace`.
 const WHATSAPP_PATCHES_JS: &str = r#"
   (() => {
-        if (window.__whatsapp_lite_notif_installed) {
+        if (window.__whatsapp_lite_patches_installed) {
             return;
         }
-        window.__whatsapp_lite_notif_installed = true;
-
-    let unreadChats = new Map();
-    let debugMode = false;
-        let firstScanDone = false;
-    
-    function logDebug(...args) {
-      if (debugMode) console.log('[WA-Tauri]', ...args);
-    }
+        window.__whatsapp_lite_patches_installed = true;
 
         const tauriInvoke = async (cmd, payload) => {
             const internals = window.__TAURI_INTERNALS__;
@@ -186,275 +312,132 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             throw new Error('Tauri invoke indisponivel');
         };
 
-        const isWindowActive = async () => {
-            try {
-                return await tauriInvoke('is_window_visible', {});
-            } catch (_) {
-                return document.hasFocus();
-            }
-        };
+        // === Proxy do Notification ==============================================
+        // Quando WhatsApp Web faz `new Notification(title, options)`, instanciamos
+        // a nossa classe, forwardamos `title` + `body` + `icon` (avatar) para o
+        // Toast nativo (Rust), e mantemos o objeto em __waNotifs pra que, quando
+        // o usuário clicar na toast, possamos invocar de volta o `onclick` que o
+        // WhatsApp Web instalou — assim o app navega para a conversa certa.
+        const __waNotifs = new Map();
+        let __waNotifCounter = 0;
 
-        const getChatRows = () => {
-            const pane = document.getElementById('pane-side');
-            if (!pane) {
-                return [];
-            }
-            const grid = pane.querySelector('[role="grid"]') || pane;
-            const rows = grid.querySelectorAll('[role="row"]');
-            return Array.from(rows);
-        };
+        class WALiteNotification extends EventTarget {
+            constructor(title, options) {
+                super();
+                options = options || {};
 
-        const extractContactName = (row) => {
-            const titled = row.querySelectorAll('span[title]');
-            for (const el of titled) {
-                const text = (el.getAttribute('title') || '').trim();
-                const low = text.toLowerCase();
-                if (!text) continue;
-                if (low.startsWith('ic-')) continue;
-                if (low.includes('mensagem n\u00e3o lida') || low.includes('mensagens n\u00e3o lidas')) continue;
-                if (low.includes('unread')) continue;
-                return text;
-            }
+                this.title = String(title || '');
+                this.body = String(options.body || '');
+                this.icon = options.icon || '';
+                this.badge = options.badge || '';
+                this.tag = options.tag || '';
+                this.data = options.data;
+                this.silent = !!options.silent;
+                this.requireInteraction = !!options.requireInteraction;
+                this.lang = options.lang || '';
+                this.dir = options.dir || 'auto';
+                this.timestamp = options.timestamp || Date.now();
 
-            const autos = row.querySelectorAll('span[dir="auto"], span[dir="ltr"]');
-            for (const el of autos) {
-                const text = (el.textContent || '').trim();
-                const low = text.toLowerCase();
-                if (!text) continue;
-                if (low.startsWith('ic-')) continue;
-                if (/^\d{1,2}:\d{2}$/.test(text)) continue;
-                if (/^\d{1,4}$/.test(text)) continue;
-                if (low.includes('conversa favorita') || low.includes('conversa silenciada')) continue;
-                return text;
-            }
+                this.onclick = null;
+                this.onshow = null;
+                this.onclose = null;
+                this.onerror = null;
 
-            return '';
-        };
+                const notifId = String(++__waNotifCounter);
+                this.__waNotifId = notifId;
+                __waNotifs.set(notifId, this);
+                // GC: limpa depois de 60s pra não vazar memória
+                setTimeout(() => __waNotifs.delete(notifId), 60000);
 
-        const isMuted = (row) => {
-            if (row.querySelector('[data-icon="muted"]')) {
-                return true;
+                this.__waSend().catch((err) => {
+                    console.error('[WhatsApp Lite] Falha ao enviar notificação:', err);
+                    this.__waFire('error');
+                });
             }
 
-            const ariaNodes = row.querySelectorAll('[aria-label]');
-            for (const n of ariaNodes) {
-                const label = ((n.getAttribute('aria-label') || '') + '').toLowerCase();
-                if (!label) continue;
-                if (label.includes('conversa silenciada') || label.includes('chat muted') || label.includes('muted')) {
-                    return true;
-                }
-            }
-
-            const iconTitles = row.querySelectorAll('svg title');
-            for (const t of iconTitles) {
-                const val = ((t.textContent || '') + '').toLowerCase().trim();
-                if (!val) continue;
-                if (val.includes('notifications-off') || val.includes('muted')) {
-                    return true;
-                }
-            }
-
-            return false;
-        };
-
-        const getUnreadCount = (row) => {
-            const badges = row.querySelectorAll('span[aria-label]');
-            for (const badge of badges) {
-                const ariaLabel = (badge.getAttribute('aria-label') || '').toLowerCase();
-                if (!ariaLabel) continue;
-
-                const isUnreadLabel =
-                    ariaLabel.includes('mensagem n\u00e3o lida') ||
-                    ariaLabel.includes('mensagens n\u00e3o lidas') ||
-                    ariaLabel.includes('mensagem nao lida') ||
-                    ariaLabel.includes('mensagens nao lidas') ||
-                    ariaLabel.includes('unread');
-
-                if (!isUnreadLabel) continue;
-
-                const numberText = (badge.textContent || '').trim();
-                const numberFromText = numberText.match(/\d+/);
-                if (numberFromText) {
-                    return parseInt(numberFromText[0], 10);
-                }
-
-                const numberFromLabel = ariaLabel.match(/\d+/);
-                if (numberFromLabel) {
-                    return parseInt(numberFromLabel[0], 10);
-                }
-
-                return 1;
-            }
-
-            return 0;
-        };
-
-        const mediaLabelFromRow = (row) => {
-            const iconSpans = row.querySelectorAll('span[data-icon]');
-            for (const el of iconSpans) {
-                const iconType = (el.getAttribute('data-icon') || '').toLowerCase();
-                if (!iconType) continue;
-                if (iconType.includes('sticker')) return 'Figurinha';
-                if (iconType.includes('video')) return 'Video';
-                if (iconType.includes('audio')) return 'Audio';
-                if (iconType.includes('camera') || iconType.includes('image') || iconType.includes('photo')) return 'Foto';
-                if (iconType.includes('document') || iconType.includes('doc')) return 'Documento';
-                if (iconType.includes('gif')) return 'GIF';
-            }
-
-            const iconTitles = row.querySelectorAll('svg title');
-            for (const title of iconTitles) {
-                const text = ((title.textContent || '') + '').toLowerCase();
-                if (!text) continue;
-                if (text.includes('sticker')) return 'Figurinha';
-                if (text.includes('video')) return 'Video';
-                if (text.includes('audio') || text.includes('mic')) return 'Audio';
-                if (text.includes('camera') || text.includes('image') || text.includes('photo')) return 'Foto';
-                if (text.includes('document')) return 'Documento';
-                if (text.includes('gif')) return 'GIF';
-            }
-
-            return '';
-        };
-
-        const extractPreview = (row, contactName) => {
-            const mediaLabel = mediaLabelFromRow(row);
-            const candidates = row.querySelectorAll('span[dir="auto"], span[dir="ltr"], span[title]');
-            let best = '';
-
-            for (const sp of candidates) {
-                const raw = (sp.getAttribute('title') || sp.textContent || '').replace(/\s+/g, ' ').trim();
-                if (!raw) continue;
-
-                const low = raw.toLowerCase();
-                if (low.startsWith('ic-')) continue;
-                if (low === 'conversa favorita') continue;
-                if (low === 'conversa silenciada') continue;
-                if (low.includes('mensagem n\u00e3o lida') || low.includes('mensagens n\u00e3o lidas')) continue;
-                if (low.includes('mensagem nao lida') || low.includes('mensagens nao lidas')) continue;
-                if (low.includes('unread')) continue;
-                if (/^\d{1,2}:\d{2}$/.test(raw)) continue;
-                if (/^\d{1,4}$/.test(raw)) continue;
-                if (contactName && raw === contactName) continue;
-                if (raw === ':') continue;
-
-                best = raw;
-            }
-
-            let preview = best || mediaLabel || 'Nova mensagem';
-            if (preview.length > 180) {
-                preview = preview.slice(0, 180) + '...';
-            }
-            return preview;
-        };
-
-        const scanUnreadChats = async () => {
-            const chatRows = getChatRows();
-            const currentUnreadChats = new Set();
-            const windowActive = await isWindowActive();
-
-            for (const row of chatRows) {
-                const contactName = extractContactName(row);
-                if (!contactName) {
-                    continue;
-                }
-
-                const muted = isMuted(row);
-                const unreadCount = getUnreadCount(row);
-
-                logDebug('Scan result:', contactName, 'Muted:', muted, 'Unread:', unreadCount);
-
-                if (unreadCount <= 0) {
-                    unreadChats.delete(contactName);
-                    continue;
-                }
-
-                currentUnreadChats.add(contactName);
-                const previousCount = unreadChats.get(contactName) || 0;
-
-                // Regra de ouro #2: silenciado nunca notifica.
-                if (muted) {
-                    unreadChats.set(contactName, unreadCount);
-                    continue;
-                }
-
-                // Regra de ouro #1: so notifica quando aumenta contador de nao lidas.
-                if (!firstScanDone && unreadCount >= 0) {
-                    unreadChats.set(contactName, unreadCount);
-                    continue;
-                }
-
-                if (unreadCount > previousCount && !windowActive) {
-                    const previewText = extractPreview(row, contactName);
-                    logDebug('New unread message from', contactName, 'Count:', unreadCount, 'Preview:', previewText);
-
-                    tauriInvoke('send_notification', {
-                        title: contactName,
-                        body: previewText
-                    }).catch(console.error);
-                }
-
-                unreadChats.set(contactName, unreadCount);
-            }
-
-            for (const key of Array.from(unreadChats.keys())) {
-                if (!currentUnreadChats.has(key)) {
-                    unreadChats.delete(key);
-                }
-            }
-
-            firstScanDone = true;
-        };
-
-    // Observer setup
-    logDebug('Initializing observer...');
-    let scanTimer = null;
-    const observer = new MutationObserver((mutations) => {
-        let shouldScan = false;
-        
-        for (const mutation of mutations) {
-            // Looking for changes in the chat list or elements inside list items
-            if (mutation.target && mutation.target.closest && mutation.target.closest('#pane-side')) {
-                shouldScan = true;
-                break;
-            }
-            if (mutation.target.id === 'pane-side') {
-                shouldScan = true;
-                break;
-            }
-        }
-
-        if (shouldScan) {
-                        if (scanTimer) {
-                            clearTimeout(scanTimer);
+            async __waSend() {
+                let imageBytes = null;
+                const iconUrl = this.icon;
+                if (iconUrl) {
+                    try {
+                        const resp = await fetch(iconUrl);
+                        if (resp.ok) {
+                            const buf = await resp.arrayBuffer();
+                            imageBytes = Array.from(new Uint8Array(buf));
                         }
-                        scanTimer = setTimeout(() => {
-                            scanUnreadChats().catch(console.error);
-                        }, 250);
-        }
-    });
+                    } catch (_) {
+                        // Sem avatar — segue sem
+                    }
+                }
 
-    // Start observing when the chat list is available
-    const startObserving = () => {
-        const chatListContainer = document.getElementById('pane-side');
-        if (chatListContainer) {
-            logDebug('Found pane-side, starting observer');
-            observer.observe(chatListContainer, {
-                childList: true,
-                subtree: true,
-                characterData: true,
-                attributes: true,
-                attributeFilter: ['aria-label', 'title', 'data-icon']
-            });
-            // Initial scan
-            scanUnreadChats().catch(console.error);
-            setInterval(() => {
-              scanUnreadChats().catch(console.error);
-            }, 2500);
-        } else {
-            setTimeout(startObserving, 1000);
+                await tauriInvoke('send_notification', {
+                    title: this.title,
+                    body: this.body,
+                    imageBytes: imageBytes,
+                    notificationId: this.__waNotifId,
+                    // `tag` é o chat id que o WhatsApp Web põe no options.tag
+                    // (tipicamente "<numero>@c.us" ou "<id>@g.us"). É o que o
+                    // Rust usa pra setar Toast.Tag/Group e fazer substituição
+                    // por chat no Windows.
+                    tag: this.tag || ''
+                });
+
+                this.__waFire('show');
+            }
+
+            __waFire(name, evInit) {
+                let ev;
+                try { ev = new Event(name, evInit || {}); }
+                catch (_) { ev = new Event(name); }
+                const handler = this['on' + name];
+                if (typeof handler === 'function') {
+                    try { handler.call(this, ev); }
+                    catch (e) { console.error('[WhatsApp Lite] handler ' + name + ':', e); }
+                }
+                try { this.dispatchEvent(ev); } catch (_) {}
+            }
+
+            close() {
+                __waNotifs.delete(this.__waNotifId);
+                this.__waFire('close');
+            }
         }
-    };
+
+        Object.defineProperty(WALiteNotification, 'permission', {
+            get() { return 'granted'; },
+            configurable: true
+        });
+        WALiteNotification.requestPermission = function(cb) {
+            if (typeof cb === 'function') {
+                try { cb('granted'); } catch (_) {}
+            }
+            return Promise.resolve('granted');
+        };
+        WALiteNotification.maxActions = 0;
+
+        try {
+            Object.defineProperty(window, 'Notification', {
+                value: WALiteNotification,
+                writable: true,
+                configurable: true
+            });
+        } catch (_) {
+            try { window.Notification = WALiteNotification; } catch (_) {}
+        }
+
+        // Chamado pelo Rust via eval quando a toast nativa é clicada.
+        // Re-dispara o onclick que o WhatsApp Web instalou no objeto Notification
+        // (que tipicamente faz `window.focus()` + abre a conversa correspondente).
+        window.__waLiteOnNotifClick = function(notifId) {
+            const notif = __waNotifs.get(String(notifId));
+            if (!notif) return;
+            try {
+                notif.__waFire('click', { cancelable: true });
+            } catch (e) {
+                console.error('[WhatsApp Lite] Erro no click handler:', e);
+            }
+            __waNotifs.delete(String(notifId));
+        };
 
         // === Atalhos de teclado ===
         if (!window.__whatsapp_lite_shortcuts_installed) {
@@ -675,12 +658,57 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             }, true);
         }
 
-    // Start the process once DOM is ready
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', startObserving);
-    } else {
-        startObserving();
-    }
+        // === Rede de segurança extra contra navegação externa programática ===
+        // O guard real é o on_navigation no nível da WebView (Rust). Estes hooks
+        // em JS evitam que o WhatsApp Web sequer dispare a tentativa de navegar
+        // para facebook.com / Meta Accounts Center via window.open, location.assign
+        // ou location.replace — APIs que o click handler em <a> não cobre.
+        if (!window.__whatsapp_lite_nav_hooks_installed) {
+            window.__whatsapp_lite_nav_hooks_installed = true;
+
+            const isExternalNavUrl = (urlStr) => {
+                try {
+                    const u = new URL(String(urlStr), window.location.href);
+                    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+                    return u.origin !== window.location.origin;
+                } catch (_) {
+                    return false;
+                }
+            };
+
+            const __waOrigOpen = window.open.bind(window);
+            window.open = function(url, target, features) {
+                if (url && isExternalNavUrl(url)) {
+                    tauriInvoke('open_external_url', { url: String(url) }).catch(console.error);
+                    return null;
+                }
+                return __waOrigOpen(url, target, features);
+            };
+
+            try {
+                const __waOrigAssign = window.location.assign.bind(window.location);
+                const __waOrigReplace = window.location.replace.bind(window.location);
+
+                window.location.assign = function(url) {
+                    if (isExternalNavUrl(url)) {
+                        tauriInvoke('open_external_url', { url: String(url) }).catch(console.error);
+                        return;
+                    }
+                    return __waOrigAssign(url);
+                };
+
+                window.location.replace = function(url) {
+                    if (isExternalNavUrl(url)) {
+                        tauriInvoke('open_external_url', { url: String(url) }).catch(console.error);
+                        return;
+                    }
+                    return __waOrigReplace(url);
+                };
+            } catch (e) {
+                console.error('[WhatsApp Lite] Falha ao instalar hooks de location:', e);
+            }
+        }
+
   })();
 "#;
 
@@ -771,30 +799,49 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Cria a janela principal com guard de navegação:
+            // qualquer navegação para fora de *.whatsapp.com / *.whatsapp.net
+            // é bloqueada e a URL é aberta no navegador do sistema. Isso impede
+            // que o frame do WhatsApp Web seja redirecionado para facebook.com,
+            // accountscenter.facebook.com etc. via navegação programática do
+            // próprio JS do WhatsApp Web (que o click handler em <a> não pega).
+            let nav_app_handle = app.handle().clone();
+            let main_window = WebviewWindowBuilder::new(
+                app,
+                "main",
+                WebviewUrl::External("https://web.whatsapp.com".parse().unwrap()),
+            )
+            .title("WhatsAppLite")
+            .inner_size(1100.0, 720.0)
+            .min_inner_size(780.0, 480.0)
+            .center()
+            .decorations(true)
+            .resizable(true)
+            .disable_drag_drop_handler()
+            // initialization_script roda em document_start, antes de qualquer
+            // script do WhatsApp Web. Isso garante que o proxy do Notification
+            // já esteja instalado quando o bundle deles consultar permission
+            // ou chamar `new Notification(...)`. Substitui a antiga thread que
+            // ficava injetando via eval em loop.
+            .initialization_script(WHATSAPP_PATCHES_JS)
+            .on_navigation(move |url| {
+                let host = url.host_str().unwrap_or("");
+                let allowed = host == "web.whatsapp.com"
+                    || host == "whatsapp.com"
+                    || host.ends_with(".whatsapp.com")
+                    || host.ends_with(".whatsapp.net");
+                if !allowed {
+                    let url_str = url.to_string();
+                    let _ = nav_app_handle.opener().open_url(&url_str, None::<&str>);
+                }
+                allowed
+            })
+            .build()?;
+
             // Se iniciou com --hidden, esconde a janela (fica só na tray)
-            let main_window = app.get_webview_window("main").unwrap();
             if start_hidden {
                 let _ = main_window.hide();
             }
-
-            // Injeta patches JS
-            let patches_js = WHATSAPP_PATCHES_JS.to_string();
-            
-            let win_for_patches = main_window.clone();
-            std::thread::spawn(move || {
-                // Injeta repetidamente no início para garantir que o script seja executado
-                // assim que o documento HTML estiver minimamente preparado, evitando delay
-                for _ in 0..5 {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    let _ = win_for_patches.eval(&patches_js);
-                }
-                
-                // Depois mantém injetando ocasionalmente em caso de reload total do site
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                    let _ = win_for_patches.eval(&patches_js);
-                }
-            });
 
             // Minimiza para tray ao invés de fechar
             let win_handle = main_window.app_handle().clone();
@@ -815,8 +862,7 @@ pub fn run() {
             append_binary_file,
             open_external_url,
             focus_main_window,
-            send_notification,
-            is_window_visible
+            send_notification
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

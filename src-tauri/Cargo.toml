@@ -23,6 +23,11 @@ tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2.4.5"
 tauri-plugin-notification = "2"
 tauri-winrt-notification = "0.7.2"
+windows = { version = "0.61", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+] }
 
 [profile.release]
 opt-level = "s"
