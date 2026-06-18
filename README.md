@@ -90,7 +90,20 @@ O codigo injeta um patch local para integrar notificacoes, downloads, atalhos, t
 
 O Windows SmartScreen pode alertar porque este e um app novo/independente. Confira o repositorio, os hashes do release e compile localmente se preferir.
 
+## Transparency and security
+
+This app is a Tauri wrapper for `https://web.whatsapp.com`. It has no backend server, does not collect logins, and does not send messages to third parties.
+
+It injects a local patch to integrate native notifications, downloads, shortcuts, tray behavior, and safe external-link handling. See [SECURITY.md](SECURITY.md) for details.
+
+Windows SmartScreen may warn because this is a new independent app. Check the repository, verify the release hashes, or build it locally if you prefer.
+
 ## Aviso legal
 
 Este projeto e independente e nao possui afiliacao oficial com WhatsApp ou Meta.
 WhatsApp e marca de seus respectivos proprietarios.
+
+## Disclaimer
+
+This project is independent and is not officially affiliated with WhatsApp or Meta.
+WhatsApp is a trademark of its respective owners.
