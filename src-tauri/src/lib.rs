@@ -76,6 +76,41 @@ fn focus_main_window(app: tauri::AppHandle) {
     }
 }
 
+/// Apaga avatares `wa_lite_avatar_*.png` do `%TEMP%` com mais de 24h. Roda no
+/// startup. Não falha; erros são silenciosos (é só hygiene).
+fn cleanup_old_avatar_temp_files() {
+    let cutoff = match std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(24 * 60 * 60))
+    {
+        Some(t) => t,
+        None => return,
+    };
+
+    let temp_dir = std::env::temp_dir();
+    let entries = match std::fs::read_dir(&temp_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.starts_with("wa_lite_avatar_") || !name.ends_with(".png") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if modified < cutoff {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+}
+
 /// Monta o XML do toast manualmente, cria uma `ToastNotification`, seta `Tag` e
 /// `Group` (que o wrapper `tauri-winrt-notification` 0.7.2 só expõe pra toasts
 /// de progresso) e registra o handler de Activated com bridge pra JS. Tag+Group
@@ -296,6 +331,7 @@ fn send_notification(
 ///    programática externa via `window.open` / `location.assign|replace`.
 const WHATSAPP_PATCHES_JS: &str = r#"
   (() => {
+
         if (window.__whatsapp_lite_patches_installed) {
             return;
         }
@@ -443,9 +479,44 @@ const WHATSAPP_PATCHES_JS: &str = r#"
         if (!window.__whatsapp_lite_shortcuts_installed) {
             window.__whatsapp_lite_shortcuts_installed = true;
 
+            const findChatInput = () => {
+                // aria-label distingue chat input de search input — search usa
+                // "Caixa de texto de pesquisa"/"Search input textbox"; chat usa
+                // "Digite uma mensagem"/"Type a message". É o jeito mais estável.
+                const byAria = document.querySelector(
+                    'div[contenteditable="true"][aria-label*="mensagem" i],'
+                    + ' div[contenteditable="true"][aria-label*="message" i],'
+                    + ' div[contenteditable="true"][aria-label*="mensaje" i]'
+                );
+                if (byAria) return byAria;
+
+                // Fallback histórico (data-tab WhatsApp Web)
+                const byTab = document.querySelector('div[contenteditable="true"][data-tab="10"]');
+                if (byTab) return byTab;
+
+                // Fallback geográfico: chat input é o contenteditable visível mais
+                // próximo do fim da tela. Search fica no topo do painel esquerdo,
+                // então o "mais baixo" nunca é ela.
+                const editables = Array.from(document.querySelectorAll('div[contenteditable="true"]'));
+                let best = null;
+                let bestY = -Infinity;
+                for (const ed of editables) {
+                    const r = ed.getBoundingClientRect();
+                    if (r.height < 16 || r.width < 100) continue;
+                    if (r.top > bestY) {
+                        best = ed;
+                        bestY = r.top;
+                    }
+                }
+                return best;
+            };
+
             document.addEventListener('keydown', (e) => {
-                // Ctrl+W -> fecha conversa (equivalente a Escape no WhatsApp Web)
-                if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'w' || e.key === 'W')) {
+                // Ctrl+W -> Escape, fecha conversa. Exige !altKey: no ABNT2
+                // brasileiro Ctrl+(left Alt) é alias de AltGr, e AltGr+W gera
+                // "?" no SO. Se não excluíssemos altKey, qualquer tentativa de
+                // digitar "?" no input do chat fecharia a conversa.
+                if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === 'KeyW') {
                     e.preventDefault();
                     e.stopPropagation();
 
@@ -470,11 +541,7 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                     e.preventDefault();
                     e.stopPropagation();
 
-                    const input = document.querySelector('div[contenteditable="true"][data-tab="10"]')
-                        || document.querySelector('footer div[contenteditable="true"]')
-                        || document.querySelector('div[title="Digite uma mensagem"]')
-                        || document.activeElement;
-
+                    const input = findChatInput();
                     if (input) {
                         input.focus();
                         input.dispatchEvent(new KeyboardEvent('keydown', {
@@ -486,6 +553,63 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                             cancelable: true
                         }));
                     }
+                    return;
+                }
+
+                // Ctrl+Shift+E -> abre o seletor de emoji (clica no botão do footer).
+                // WhatsApp Web já trata abrir/fechar via toggle, então um clique
+                // basta; um segundo Ctrl+Shift+E fecha.
+                if (e.ctrlKey && e.shiftKey && !e.altKey && (e.key === 'e' || e.key === 'E')) {
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    // Múltiplas heurísticas porque WhatsApp varia o atributo.
+                    const emojiBtn =
+                        document.querySelector('button[aria-label="Inserir emoji" i]')
+                        || document.querySelector('button[aria-label*="emoji" i]')
+                        || document.querySelector('[data-icon="smiley"]')?.closest('button, [role="button"]')
+                        || document.querySelector('[data-icon="smiley-emoji-input"]')?.closest('button, [role="button"]')
+                        || document.querySelector('button[title*="emoji" i]')
+                        || document.querySelector('footer button:has(span[data-icon*="smiley"])');
+
+                    if (emojiBtn) {
+                        emojiBtn.click();
+                    }
+                    return;
+                }
+
+                // Ctrl+Alt+Q -> insere "/" no input do chat.
+                // Detecta pelo CÓDIGO físico da tecla (KeyQ), não pela e.key,
+                // porque em teclado ABNT2 (Brasil) Ctrl+(left Alt) é alias de
+                // AltGr no Windows, e AltGr+Q gera "/" no nível do SO. Sem
+                // isso, o e.key chegaria como "/" e a condição não casaria.
+                if (e.ctrlKey && e.altKey && !e.shiftKey && e.code === 'KeyQ') {
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    const input = findChatInput();
+                    if (input && input.isContentEditable) {
+                        input.focus();
+                        // setTimeout(0) deixa o focus aplicar antes do
+                        // execCommand, que opera no elemento focado AGORA.
+                        // Sem isso, se o foco anterior era a busca, o "/"
+                        // ia parar lá.
+                        setTimeout(() => {
+                            input.focus();
+                            try {
+                                document.execCommand('insertText', false, '/');
+                            } catch (_) {
+                                const ev = new InputEvent('beforeinput', {
+                                    inputType: 'insertText',
+                                    data: '/',
+                                    bubbles: true,
+                                    cancelable: true
+                                });
+                                input.dispatchEvent(ev);
+                            }
+                        }, 0);
+                    }
+                    return;
                 }
             }, true);
         }
@@ -709,6 +833,163 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             }
         }
 
+        // === Substituição do banner "Baixar o WhatsApp" pelo logo do Lite ====
+        // ESTRATÉGIA (v3 — CSS-only):
+        // O WhatsApp Web é React. Anteriormente tentamos `replaceChildren()`
+        // e anexar um overlay como filho — React desfazia ou tinha problemas
+        // de descoberta do card. A v3 usa CSS pura:
+        //
+        //   1. Injeta um <style> com:
+        //      - `[data-wa-lite-banner="1"]` → recebe background-image com a
+        //        data URL do logo, ocupando o card inteiro (contain, center).
+        //        Sem cor de fundo. Sem borda. Sem shadow.
+        //      - `[data-wa-lite-banner="1"] > *` → `visibility: hidden`,
+        //        que preserva o layout (mantém as dimensões do card pro
+        //        background ter onde se renderizar) mas esconde o conteúdo
+        //        original.
+        //      O <style> é injetado UMA vez e nunca removido. React não
+        //      mexe em <style> que não criou.
+        //   2. JS apenas adiciona o atributo `data-wa-lite-banner="1"` no
+        //      card. Nada mais. Não anexa overlay, não toca em filhos.
+        //   3. MutationObserver re-marca se o card for substituído.
+        const __waLiteLogoUrl = "data:image/png;base64,__WA_LITE_LOGO_B64__";
+
+        // Regex multi-idioma. Para casar com "Baixar o WhatsApp para Windows",
+        // "Get WhatsApp for Windows", etc.
+        const __waTitleRe = /\b(baixar|baixe|baixa|obter|obtenha|get|download|descargar|descarga|t[ée]l[ée]charger|herunterladen|scarica)\b[^.\n]{0,60}\bwhatsapp\b/i;
+        const __waButtonRe = /^(baixar|baixe|download|obter|obtenha|get|descargar|descarga|t[ée]l[ée]charger|herunterladen|scarica)(\s|$)/i;
+
+        // CSS injetado UMA vez. `background-image: contain` + `padding`
+        // generoso pra o logo aparecer menor que o card (o card pode ser
+        // o painel direito inteiro do WhatsApp Web, que é grande). Os
+        // filhos diretos ficam `visibility: hidden` pra preservar o
+        // layout do card sem mostrar o conteúdo original.
+        const __waInjectStyles = () => {
+            if (document.getElementById('wa-lite-banner-style')) return;
+            const style = document.createElement('style');
+            style.id = 'wa-lite-banner-style';
+            style.textContent = ''
+                + '[data-wa-lite-banner="1"] {'
+                +   'background-color: transparent !important;'
+                +   'background-image: url("' + __waLiteLogoUrl + '") !important;'
+                +   'background-repeat: no-repeat !important;'
+                +   'background-position: center center !important;'
+                +   'background-size: contain !important;'
+                +   'background-origin: content-box !important;'
+                +   'padding: 80px 50px !important;'
+                +   'box-sizing: border-box !important;'
+                +   'box-shadow: none !important;'
+                +   'border: none !important;'
+                + '}'
+                + '[data-wa-lite-banner="1"] > * {'
+                +   'visibility: hidden !important;'
+                +   'pointer-events: none !important;'
+                + '}';
+            (document.head || document.documentElement).appendChild(style);
+        };
+
+        const __waIsVisible = (el) => {
+            if (!el) return false;
+            if (el.offsetParent === null && el.tagName !== 'BODY') {
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 && r.height === 0) return false;
+            }
+            return true;
+        };
+
+        // Encontra o card do banner em 2 estratégias:
+        //   (A) Por elementos com texto curto casando título
+        //       "Baixar...WhatsApp" → sobe pelo ancestral mais próximo
+        //       com dimensão de card (220-1000 wide × 200-900 tall).
+        //       Range amplo de propósito: em monitores grandes ou janelas
+        //       maximizadas, o painel direito do WhatsApp Web pode ser
+        //       pego. O CSS limita o tamanho do logo via padding generoso.
+        //   (B) Por botão "Baixar"/"Get" → sobe pelo ancestral que
+        //       contém também o título no textContent. Fallback.
+        const __waFindBannerCard = () => {
+            // (A) Por título.
+            const titleCandidates = document.querySelectorAll(
+                'h1, h2, h3, h4, h5, h6, [role="heading"], strong, b, ' +
+                'div, span, p'
+            );
+            for (const t of titleCandidates) {
+                const ownText = (t.textContent || '').replace(/\s+/g, ' ').trim();
+                if (ownText.length < 10 || ownText.length > 160) continue;
+                if (!__waTitleRe.test(ownText)) continue;
+                if (!__waIsVisible(t)) continue;
+
+                let el = t.parentElement;
+                for (let i = 0; i < 18 && el && el !== document.body; i++) {
+                    if (__waIsVisible(el)) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width >= 220 && r.width <= 1000
+                            && r.height >= 200 && r.height <= 900) {
+                            return { card: el, strategy: 'title', rect: r };
+                        }
+                    }
+                    el = el.parentElement;
+                }
+            }
+
+            // (B) Por botão.
+            const btnCandidates = document.querySelectorAll(
+                'button, [role="button"], a, [role="link"]'
+            );
+            for (const btn of btnCandidates) {
+                const text = (btn.textContent || '').replace(/\s+/g, ' ').trim();
+                if (text.length === 0 || text.length > 40) continue;
+                if (!__waButtonRe.test(text)) continue;
+                if (!__waIsVisible(btn)) continue;
+
+                let el = btn.parentElement;
+                for (let i = 0; i < 18 && el && el !== document.body; i++) {
+                    const cardText = (el.textContent || '');
+                    if (cardText.length > 2000) break;
+                    if (__waTitleRe.test(cardText)) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width >= 220 && r.height >= 200) {
+                            return { card: el, strategy: 'button', rect: r };
+                        }
+                    }
+                    el = el.parentElement;
+                }
+            }
+
+            return null;
+        };
+
+        const __waApply = () => {
+            try { __waInjectStyles(); } catch (e) { return false; }
+            let result = null;
+            try { result = __waFindBannerCard(); } catch (e) { return false; }
+            if (!result) return false;
+            const card = result.card;
+            if (card.getAttribute('data-wa-lite-banner') !== '1') {
+                card.setAttribute('data-wa-lite-banner', '1');
+            }
+            return true;
+        };
+
+        window.__waLiteForceReplace = __waApply;
+        window.__waLiteFindCard = __waFindBannerCard;
+
+        let __waScheduled = false;
+        const __waSchedule = () => {
+            if (__waScheduled) return;
+            __waScheduled = true;
+            requestAnimationFrame(() => {
+                __waScheduled = false;
+                try { __waApply(); } catch (e) {}
+            });
+        };
+
+        new MutationObserver(__waSchedule).observe(
+            document.documentElement,
+            { childList: true, subtree: true }
+        );
+        __waSchedule();
+        setInterval(__waSchedule, 1000);
+
   })();
 "#;
 
@@ -733,11 +1014,11 @@ pub fn run() {
             Some(vec!["--hidden"]),
         ))
         .setup(|app| {
-            // Log imediato para confirmar que setup() esta sendo executado
-            let _ = std::fs::write(
-                r"C:\Users\Levi\Desktop\whatsapp_lite_debug.log",
-                "setup() iniciou\n"
-            );
+            // Limpeza: avatares temporários com mais de 24h ficam órfãos quando o
+            // usuário conversa com gente nova e nunca mais com a antiga. Não é
+            // crítico (o Windows limpa %TEMP% periodicamente), mas mantém a pasta
+            // enxuta. Custo: <50ms no startup.
+            cleanup_old_avatar_temp_files();
 
             // Habilita o autostart na primeira execução
             use tauri_plugin_autostart::ManagerExt;
@@ -823,7 +1104,19 @@ pub fn run() {
             // já esteja instalado quando o bundle deles consultar permission
             // ou chamar `new Notification(...)`. Substitui a antiga thread que
             // ficava injetando via eval em loop.
-            .initialization_script(WHATSAPP_PATCHES_JS)
+            //
+            // O placeholder __WA_LITE_LOGO_B64__ é trocado pelo base64 do PNG
+            // embedado em build time — a data URL resultante vira o `src` da
+            // <img> que substitui o card "Baixar o WhatsApp". Custo único de
+            // startup: ~300KB de string + base64 encode em ~1ms.
+            .initialization_script(&WHATSAPP_PATCHES_JS.replace(
+                "__WA_LITE_LOGO_B64__",
+                &{
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .encode(include_bytes!("../../WhatsApp Lite Logo.png"))
+                },
+            ))
             .on_navigation(move |url| {
                 let host = url.host_str().unwrap_or("");
                 let allowed = host == "web.whatsapp.com"
@@ -837,6 +1130,13 @@ pub fn run() {
                 allowed
             })
             .build()?;
+
+            // Devtools opcional: setar WA_LITE_DEVTOOLS=1 no ambiente abre
+            // automaticamente. Sem isso, F12 também funciona (a feature
+            // `devtools` no Cargo.toml mantém o atalho habilitado em release).
+            if std::env::var("WA_LITE_DEVTOOLS").as_deref() == Ok("1") {
+                main_window.open_devtools();
+            }
 
             // Se iniciou com --hidden, esconde a janela (fica só na tray)
             if start_hidden {
@@ -867,4 +1167,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
