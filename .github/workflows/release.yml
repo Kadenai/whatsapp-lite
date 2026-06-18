@@ -11,7 +11,61 @@ permissions:
   attestations: write
 
 jobs:
+  linux:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Linux dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install
+        run: npm ci
+
+      - name: Verify
+        run: |
+          npm run verify:no-right-click
+          npm run verify:no-download-banner
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build
+        run: npm run build
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          cp src-tauri/target/release/bundle/deb/*.deb release/
+          cp src-tauri/target/release/bundle/appimage/*.AppImage release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: release/*
+
   windows:
+    needs: linux
     runs-on: windows-latest
 
     steps:
@@ -46,6 +100,14 @@ jobs:
           Copy-Item src-tauri\target\release\WhatsAppLite.exe release\WhatsAppLite.exe
           $setup = Get-ChildItem src-tauri\target\release\bundle\nsis\*setup.exe | Select-Object -First 1
           Copy-Item $setup.FullName "release\$($setup.Name)"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: release
+
+      - name: Make checksums
+        run: |
           npm run release:checksums -- release
 
       - uses: actions/attest-build-provenance@v2
@@ -64,9 +126,16 @@ jobs:
           Antes de instalar, confira o SHA256 em SHA256SUMS.txt.
 
           Esta versao:
+          - adiciona suporte Linux com pacotes .deb e AppImage;
+          - mantem suporte Windows com executavel portatil e instalador NSIS;
           - troca o banner do WhatsApp Desktop pela logo do WhatsApp Lite;
           - preserva a extensao original ao salvar downloads;
           - respeita o modo Nao incomodar do Windows para notificacoes;
           - inclui documentacao de seguranca e artefatos verificaveis.
           "@
-          gh release create $tag release/* --title "WhatsApp Lite $tag" --notes $notes
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag release/* --clobber
+            gh release edit $tag --title "WhatsApp Lite $tag" --notes "$notes"
+          } else {
+            gh release create $tag release/* --title "WhatsApp Lite $tag" --notes "$notes"
+          }

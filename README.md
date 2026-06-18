@@ -1,6 +1,6 @@
 # WhatsApp Lite (Rust + Tauri)
 
-WhatsApp Lite e um cliente desktop ultra-leve para Windows baseado em Rust + Tauri.
+WhatsApp Lite e um cliente desktop ultra-leve para Windows e Linux baseado em Rust + Tauri.
 Ele abre o WhatsApp Web dentro de um WebView, mas adiciona comportamento nativo de desktop para focar em desempenho.
 
 Este projeto nasceu da insatisfacao com a versao atual do WhatsApp Desktop, que é muito lento e instável.
@@ -34,6 +34,8 @@ Arquitetura resumida:
 - Tauri v2
 - JavaScript (patch injetado)
 - NSIS (instalador Windows)
+- DEB (pacote Linux)
+- AppImage (Linux portatil)
 
 ## Estrutura principal
 
@@ -48,6 +50,13 @@ Arquitetura resumida:
 - Rust toolchain
 - Dependencias de build do Tauri para Windows (MSVC/Build Tools)
 
+No Ubuntu/Debian:
+
+```bash
+sudo apt update
+sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
 ## Executar em desenvolvimento
 
 ```bash
@@ -61,9 +70,23 @@ npm run dev
 npm run build
 ```
 
-Saida padrao do instalador NSIS:
+Saida padrao no Windows:
 
 - src-tauri/target/release/bundle/nsis/
+
+Saida padrao no Linux:
+
+- src-tauri/target/release/bundle/deb/
+- src-tauri/target/release/bundle/appimage/
+
+Para Arch Linux, use o arquivo `.AppImage`, nao o `.deb`:
+
+```bash
+chmod +x WhatsAppLite*.AppImage
+./WhatsAppLite*.AppImage
+```
+
+No Windows, o Tauri usa Edge WebView2. No Linux, usa WebKitGTK. A casca Rust/Tauri continua leve, mas o desempenho real do WhatsApp Web precisa ser testado no Linux.
 
 ## Verificar downloads
 
@@ -71,6 +94,8 @@ Releases publicam:
 
 - `WhatsAppLite.exe`
 - `WhatsAppLite_*_x64-setup.exe`
+- `WhatsAppLite_*_amd64.deb`
+- `WhatsAppLite_*_amd64.AppImage`
 - `SHA256SUMS.txt`
 
 Para conferir se o arquivo baixado bate com o release:
@@ -78,6 +103,12 @@ Para conferir se o arquivo baixado bate com o release:
 ```powershell
 Get-FileHash .\WhatsAppLite.exe -Algorithm SHA256
 Get-FileHash .\WhatsAppLite_1.0.2_x64-setup.exe -Algorithm SHA256
+```
+
+No Linux:
+
+```bash
+sha256sum WhatsAppLite_*.deb WhatsAppLite_*.AppImage
 ```
 
 Compare o hash com o `SHA256SUMS.txt` do mesmo release.
