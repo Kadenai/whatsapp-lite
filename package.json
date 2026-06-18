@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-lite",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "Levi Raniere",
   "type": "module",
   "scripts": {

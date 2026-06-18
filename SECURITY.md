@@ -32,7 +32,7 @@ No PowerShell:
 
 ```powershell
 Get-FileHash .\WhatsAppLite.exe -Algorithm SHA256
-Get-FileHash .\WhatsAppLite_1.0.2_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\WhatsAppLite_1.0.3_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare os hashes com o arquivo `SHA256SUMS.txt`.
@@ -86,7 +86,7 @@ In PowerShell:
 
 ```powershell
 Get-FileHash .\WhatsAppLite.exe -Algorithm SHA256
-Get-FileHash .\WhatsAppLite_1.0.2_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\WhatsAppLite_1.0.3_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare the hashes with `SHA256SUMS.txt`.
