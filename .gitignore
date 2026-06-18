@@ -12,6 +12,7 @@ dist
 dist-ssr
 *.local
 src-tauri/target/
+release/
 WhatsApp-Lite-Installer.exe
 
 # Editor directories and files

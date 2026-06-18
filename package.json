@@ -1,11 +1,13 @@
 {
   "name": "whatsapp-lite",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.2",
   "author": "Levi Raniere",
   "type": "module",
   "scripts": {
     "verify:no-right-click": "node scripts/verify-no-right-click.js",
+    "verify:no-download-banner": "node scripts/verify-no-download-banner.js",
+    "release:checksums": "node scripts/make-release-checksums.js",
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build"

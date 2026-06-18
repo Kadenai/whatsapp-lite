@@ -65,6 +65,31 @@ Saida padrao do instalador NSIS:
 
 - src-tauri/target/release/bundle/nsis/
 
+## Verificar downloads
+
+Releases publicam:
+
+- `WhatsAppLite.exe`
+- `WhatsAppLite_*_x64-setup.exe`
+- `SHA256SUMS.txt`
+
+Para conferir se o arquivo baixado bate com o release:
+
+```powershell
+Get-FileHash .\WhatsAppLite.exe -Algorithm SHA256
+Get-FileHash .\WhatsAppLite_1.0.2_x64-setup.exe -Algorithm SHA256
+```
+
+Compare o hash com o `SHA256SUMS.txt` do mesmo release.
+
+## Transparencia e seguranca
+
+O app e um wrapper Tauri para `https://web.whatsapp.com`. Ele nao tem servidor proprio, nao coleta login e nao envia mensagens para terceiros.
+
+O codigo injeta um patch local para integrar notificacoes, downloads, atalhos, tray e abertura segura de links externos. Veja [SECURITY.md](SECURITY.md) para detalhes.
+
+O Windows SmartScreen pode alertar porque este e um app novo/independente. Confira o repositorio, os hashes do release e compile localmente se preferir.
+
 ## Aviso legal
 
 Este projeto e independente e nao possui afiliacao oficial com WhatsApp ou Meta.

@@ -1,6 +1,6 @@
 [package]
 name = "WhatsAppLite"
-version = "1.0.0"
+version = "1.0.2"
 description = "WhatsApp Desktop Ultra-Light"
 authors = ["Levi Raniere"]
 edition = "2021"
@@ -26,6 +26,8 @@ tauri-winrt-notification = "0.7.2"
 windows = { version = "0.61", features = [
     "Data_Xml_Dom",
     "Foundation",
+    "Win32_Foundation",
+    "Win32_System_Registry",
     "UI_Notifications",
 ] }
 base64 = "0.22"

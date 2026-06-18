@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install
+        run: npm ci
+
+      - name: Verify
+        run: |
+          npm run verify:no-right-click
+          npm run verify:no-download-banner
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build
+        run: npm run build
+
+      - name: Collect release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item src-tauri\target\release\WhatsAppLite.exe release\WhatsAppLite.exe
+          $setup = Get-ChildItem src-tauri\target\release\bundle\nsis\*setup.exe | Select-Object -First 1
+          Copy-Item $setup.FullName "release\$($setup.Name)"
+          npm run release:checksums -- release
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notes = @"
+          Windows pode mostrar SmartScreen porque este app ainda nao tem reputacao ampla.
+
+          Antes de instalar, confira o SHA256 em SHA256SUMS.txt.
+
+          Esta versao:
+          - troca o banner do WhatsApp Desktop pela logo do WhatsApp Lite;
+          - preserva a extensao original ao salvar downloads;
+          - respeita o modo Nao incomodar do Windows para notificacoes;
+          - inclui documentacao de seguranca e artefatos verificaveis.
+          "@
+          gh release create $tag release/* --title "WhatsApp Lite $tag" --notes $notes

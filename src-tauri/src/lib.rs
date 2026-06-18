@@ -13,11 +13,46 @@ use tauri_plugin_opener::OpenerExt;
 use std::{
     fs::OpenOptions,
     io::Write,
+    path::PathBuf,
 };
+
+fn original_extension(name: &str) -> Option<String> {
+    PathBuf::from(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| ext.to_string())
+}
+
+fn keep_original_extension_if_missing(selected: String, original_ext: Option<&str>) -> String {
+    let Some(ext) = original_ext.filter(|ext| !ext.is_empty()) else {
+        return selected;
+    };
+
+    let mut path = PathBuf::from(&selected);
+    if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| !ext.is_empty()) {
+        return selected;
+    }
+
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return selected;
+    };
+    let clean_name = file_name.trim_end_matches(['.', ' ']).to_string();
+    if clean_name.is_empty() {
+        return selected;
+    }
+
+    path.set_file_name(&clean_name);
+    path.set_extension(ext);
+    path.to_string_lossy().into_owned()
+}
 
 #[tauri::command]
 async fn open_save_dialog(app: tauri::AppHandle, suggested_name: Option<String>) -> Result<Option<String>, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    let suggested_ext = suggested_name
+        .as_deref()
+        .and_then(original_extension);
 
     let mut dialog = app.dialog().file();
     if let Some(name) = suggested_name.as_deref() {
@@ -25,7 +60,9 @@ async fn open_save_dialog(app: tauri::AppHandle, suggested_name: Option<String>)
     }
 
     dialog.save_file(move |path| {
-        let selected = path.map(|p| p.to_string());
+        let selected = path.map(|p| {
+            keep_original_extension_if_missing(p.to_string(), suggested_ext.as_deref())
+        });
         let _ = tx.send(selected);
     });
 
@@ -74,6 +111,46 @@ fn focus_main_window(app: tauri::AppHandle) {
         let _ = win.unminimize();
         let _ = win.set_focus();
     }
+}
+
+#[cfg(target_os = "windows")]
+fn quiet_hours_state_blocks_notifications(state: Option<u32>) -> bool {
+    state.is_some_and(|state| state != 0)
+}
+
+#[cfg(target_os = "windows")]
+fn read_quiet_hours_service_state() -> Option<u32> {
+    use windows::{
+        core::HSTRING,
+        Win32::System::Registry::{
+            RegGetValueW, HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_DWORD,
+        },
+    };
+
+    let mut data = 0u32;
+    let mut data_size = std::mem::size_of::<u32>() as u32;
+    let mut value_type = REG_VALUE_TYPE::default();
+    let subkey = HSTRING::from("Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\QuietHours");
+    let value_name = HSTRING::from("QuietHoursServiceState");
+
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &subkey,
+            &value_name,
+            RRF_RT_REG_DWORD,
+            Some(&mut value_type),
+            Some((&mut data as *mut u32).cast()),
+            Some(&mut data_size),
+        )
+    };
+
+    (status.0 == 0).then_some(data)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_do_not_disturb_enabled() -> bool {
+    quiet_hours_state_blocks_notifications(read_quiet_hours_service_state())
 }
 
 /// Apaga avatares `wa_lite_avatar_*.png` do `%TEMP%` com mais de 24h. Roda no
@@ -233,6 +310,10 @@ fn send_notification(
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        if windows_do_not_disturb_enabled() {
+            return Ok(());
+        }
+
         let app_id = app.config().identifier.clone();
 
         let clean_title = {
@@ -313,6 +394,38 @@ fn send_notification(
             .body(&body)
             .show()
             .map_err(|e| format!("Falha ao enviar notificação: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_dialog_keeps_original_extension_when_user_deletes_it() {
+        let path = keep_original_extension_if_missing(
+            r"C:\Users\Levi\Desktop\novo_nome".to_string(),
+            Some("pdf"),
+        );
+        assert!(path.ends_with(r"novo_nome.pdf"));
+    }
+
+    #[test]
+    fn save_dialog_respects_extension_user_typed() {
+        let path = keep_original_extension_if_missing(
+            r"C:\Users\Levi\Desktop\novo_nome.txt".to_string(),
+            Some("pdf"),
+        );
+        assert!(path.ends_with(r"novo_nome.txt"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn quiet_hours_blocks_only_nonzero_state() {
+        assert!(!quiet_hours_state_blocks_notifications(None));
+        assert!(!quiet_hours_state_blocks_notifications(Some(0)));
+        assert!(quiet_hours_state_blocks_notifications(Some(1)));
+        assert!(quiet_hours_state_blocks_notifications(Some(2)));
     }
 }
 
@@ -833,57 +946,29 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             }
         }
 
-        // === Substituição do banner "Baixar o WhatsApp" pelo logo do Lite ====
-        // ESTRATÉGIA (v3 — CSS-only):
-        // O WhatsApp Web é React. Anteriormente tentamos `replaceChildren()`
-        // e anexar um overlay como filho — React desfazia ou tinha problemas
-        // de descoberta do card. A v3 usa CSS pura:
-        //
-        //   1. Injeta um <style> com:
-        //      - `[data-wa-lite-banner="1"]` → recebe background-image com a
-        //        data URL do logo, ocupando o card inteiro (contain, center).
-        //        Sem cor de fundo. Sem borda. Sem shadow.
-        //      - `[data-wa-lite-banner="1"] > *` → `visibility: hidden`,
-        //        que preserva o layout (mantém as dimensões do card pro
-        //        background ter onde se renderizar) mas esconde o conteúdo
-        //        original.
-        //      O <style> é injetado UMA vez e nunca removido. React não
-        //      mexe em <style> que não criou.
-        //   2. JS apenas adiciona o atributo `data-wa-lite-banner="1"` no
-        //      card. Nada mais. Não anexa overlay, não toca em filhos.
-        //   3. MutationObserver re-marca se o card for substituído.
+        // Troca o banner "Baixar o WhatsApp" pela logo Lite. Sem rAF/setTimeout:
+        // o observer roda no microtask da mutacao, antes do browser pintar o card.
         const __waLiteLogoUrl = "data:image/png;base64,__WA_LITE_LOGO_B64__";
-
-        // Regex multi-idioma. Para casar com "Baixar o WhatsApp para Windows",
-        // "Get WhatsApp for Windows", etc.
+        const __waLogoAttr = 'data-wa-lite-logo-placeholder';
         const __waTitleRe = /\b(baixar|baixe|baixa|obter|obtenha|get|download|descargar|descarga|t[ée]l[ée]charger|herunterladen|scarica)\b[^.\n]{0,60}\bwhatsapp\b/i;
         const __waButtonRe = /^(baixar|baixe|download|obter|obtenha|get|descargar|descarga|t[ée]l[ée]charger|herunterladen|scarica)(\s|$)/i;
 
-        // CSS injetado UMA vez. `background-image: contain` + `padding`
-        // generoso pra o logo aparecer menor que o card (o card pode ser
-        // o painel direito inteiro do WhatsApp Web, que é grande). Os
-        // filhos diretos ficam `visibility: hidden` pra preservar o
-        // layout do card sem mostrar o conteúdo original.
-        const __waInjectStyles = () => {
-            if (document.getElementById('wa-lite-banner-style')) return;
+        const __waEnsureLogoStyle = () => {
+            if (document.getElementById('wa-lite-logo-style')) return;
             const style = document.createElement('style');
-            style.id = 'wa-lite-banner-style';
+            style.id = 'wa-lite-logo-style';
             style.textContent = ''
-                + '[data-wa-lite-banner="1"] {'
-                +   'background-color: transparent !important;'
+                + '[' + __waLogoAttr + '="1"] {'
+                +   'display: block !important;'
+                +   'width: min(var(--wa-lite-logo-width, 440px), 70vw) !important;'
+                +   'height: min(var(--wa-lite-logo-height, 360px), 55vh) !important;'
                 +   'background-image: url("' + __waLiteLogoUrl + '") !important;'
                 +   'background-repeat: no-repeat !important;'
                 +   'background-position: center center !important;'
                 +   'background-size: contain !important;'
-                +   'background-origin: content-box !important;'
-                +   'padding: 80px 50px !important;'
-                +   'box-sizing: border-box !important;'
-                +   'box-shadow: none !important;'
-                +   'border: none !important;'
-                + '}'
-                + '[data-wa-lite-banner="1"] > * {'
-                +   'visibility: hidden !important;'
                 +   'pointer-events: none !important;'
+                +   'box-shadow: none !important;'
+                +   'border: 0 !important;'
                 + '}';
             (document.head || document.documentElement).appendChild(style);
         };
@@ -897,98 +982,65 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             return true;
         };
 
-        // Encontra o card do banner em 2 estratégias:
-        //   (A) Por elementos com texto curto casando título
-        //       "Baixar...WhatsApp" → sobe pelo ancestral mais próximo
-        //       com dimensão de card (220-1000 wide × 200-900 tall).
-        //       Range amplo de propósito: em monitores grandes ou janelas
-        //       maximizadas, o painel direito do WhatsApp Web pode ser
-        //       pego. O CSS limita o tamanho do logo via padding generoso.
-        //   (B) Por botão "Baixar"/"Get" → sobe pelo ancestral que
-        //       contém também o título no textContent. Fallback.
         const __waFindBannerCard = () => {
-            // (A) Por título.
-            const titleCandidates = document.querySelectorAll(
-                'h1, h2, h3, h4, h5, h6, [role="heading"], strong, b, ' +
-                'div, span, p'
+            const nodes = document.querySelectorAll(
+                'h1, h2, h3, h4, h5, h6, [role="heading"], button, [role="button"], a, [role="link"], div, span, p'
             );
-            for (const t of titleCandidates) {
-                const ownText = (t.textContent || '').replace(/\s+/g, ' ').trim();
-                if (ownText.length < 10 || ownText.length > 160) continue;
-                if (!__waTitleRe.test(ownText)) continue;
-                if (!__waIsVisible(t)) continue;
 
-                let el = t.parentElement;
-                for (let i = 0; i < 18 && el && el !== document.body; i++) {
-                    if (__waIsVisible(el)) {
-                        const r = el.getBoundingClientRect();
-                        if (r.width >= 220 && r.width <= 1000
-                            && r.height >= 200 && r.height <= 900) {
-                            return { card: el, strategy: 'title', rect: r };
-                        }
+            // ponytail: text heuristic; use a stable WhatsApp selector if one ever exists.
+            for (const node of nodes) {
+                const ownText = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                if (ownText.length < 5 || ownText.length > 180) continue;
+                if (!__waTitleRe.test(ownText) && !__waButtonRe.test(ownText)) continue;
+                if (!__waIsVisible(node)) continue;
+
+                for (let el = node, i = 0; i < 12 && el && el !== document.body; i++, el = el.parentElement) {
+                    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (text.length > 900) break;
+                    if (!__waTitleRe.test(text) || !__waButtonRe.test(text)) continue;
+
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 240 && r.width <= 620 && r.height >= 220 && r.height <= 620) {
+                        return el;
                     }
-                    el = el.parentElement;
-                }
-            }
-
-            // (B) Por botão.
-            const btnCandidates = document.querySelectorAll(
-                'button, [role="button"], a, [role="link"]'
-            );
-            for (const btn of btnCandidates) {
-                const text = (btn.textContent || '').replace(/\s+/g, ' ').trim();
-                if (text.length === 0 || text.length > 40) continue;
-                if (!__waButtonRe.test(text)) continue;
-                if (!__waIsVisible(btn)) continue;
-
-                let el = btn.parentElement;
-                for (let i = 0; i < 18 && el && el !== document.body; i++) {
-                    const cardText = (el.textContent || '');
-                    if (cardText.length > 2000) break;
-                    if (__waTitleRe.test(cardText)) {
-                        const r = el.getBoundingClientRect();
-                        if (r.width >= 220 && r.height >= 200) {
-                            return { card: el, strategy: 'button', rect: r };
-                        }
-                    }
-                    el = el.parentElement;
                 }
             }
 
             return null;
         };
 
-        const __waApply = () => {
-            try { __waInjectStyles(); } catch (e) { return false; }
-            let result = null;
-            try { result = __waFindBannerCard(); } catch (e) { return false; }
-            if (!result) return false;
-            const card = result.card;
-            if (card.getAttribute('data-wa-lite-banner') !== '1') {
-                card.setAttribute('data-wa-lite-banner', '1');
+        const __waCreateLogo = (card) => {
+            const r = card.getBoundingClientRect();
+            const logo = document.createElement('div');
+            logo.setAttribute(__waLogoAttr, '1');
+            logo.setAttribute('aria-hidden', 'true');
+            logo.style.setProperty('--wa-lite-logo-width', Math.max(240, Math.round(r.width)) + 'px');
+            logo.style.setProperty('--wa-lite-logo-height', Math.max(220, Math.round(r.height)) + 'px');
+            return logo;
+        };
+
+        const __waReplaceBanner = () => {
+            try { __waEnsureLogoStyle(); } catch (e) {}
+            const card = __waFindBannerCard();
+            if (!card) return false;
+            if (card.getAttribute(__waLogoAttr) === '1') return false;
+            for (const logo of document.querySelectorAll('[' + __waLogoAttr + '="1"]')) {
+                logo.remove();
             }
+            card.replaceWith(__waCreateLogo(card));
             return true;
         };
 
-        window.__waLiteForceReplace = __waApply;
+        window.__waLiteReplaceBanner = __waReplaceBanner;
         window.__waLiteFindCard = __waFindBannerCard;
 
-        let __waScheduled = false;
-        const __waSchedule = () => {
-            if (__waScheduled) return;
-            __waScheduled = true;
-            requestAnimationFrame(() => {
-                __waScheduled = false;
-                try { __waApply(); } catch (e) {}
-            });
-        };
-
-        new MutationObserver(__waSchedule).observe(
-            document.documentElement,
-            { childList: true, subtree: true }
+        new MutationObserver(() => {
+            try { __waReplaceBanner(); } catch (e) {}
+        }).observe(
+            document.documentElement || document,
+            { childList: true, characterData: true, subtree: true }
         );
-        __waSchedule();
-        setInterval(__waSchedule, 1000);
+        try { __waReplaceBanner(); } catch (e) {}
 
   })();
 "#;
@@ -1104,11 +1156,6 @@ pub fn run() {
             // já esteja instalado quando o bundle deles consultar permission
             // ou chamar `new Notification(...)`. Substitui a antiga thread que
             // ficava injetando via eval em loop.
-            //
-            // O placeholder __WA_LITE_LOGO_B64__ é trocado pelo base64 do PNG
-            // embedado em build time — a data URL resultante vira o `src` da
-            // <img> que substitui o card "Baixar o WhatsApp". Custo único de
-            // startup: ~300KB de string + base64 encode em ~1ms.
             .initialization_script(&WHATSAPP_PATCHES_JS.replace(
                 "__WA_LITE_LOGO_B64__",
                 &{
