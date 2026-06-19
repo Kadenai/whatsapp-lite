@@ -14,7 +14,19 @@ use std::{
     fs::OpenOptions,
     io::Write,
     path::PathBuf,
+    time::{Duration, Instant},
 };
+
+const AUTO_RELOAD_EVERY: Duration = Duration::from_secs(60 * 60);
+const WEBVIEW_RESTART_EVERY: Duration = Duration::from_secs(4 * 60 * 60);
+const MAINTENANCE_IDLE_FOR: Duration = Duration::from_secs(3 * 60);
+const MAINTENANCE_POLL_EVERY: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceAction {
+    Reload,
+    Restart,
+}
 
 fn original_extension(name: &str) -> Option<String> {
     PathBuf::from(name)
@@ -417,6 +429,34 @@ mod tests {
             Some("pdf"),
         );
         assert!(path.ends_with(r"novo_nome.txt"));
+    }
+
+    #[test]
+    fn maintenance_waits_for_idle_grace() {
+        let now = Instant::now();
+        assert_eq!(
+            due_maintenance(
+                now,
+                now - Duration::from_secs(1),
+                now + Duration::from_secs(1),
+                Some(now - Duration::from_secs(179)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn maintenance_restart_wins_over_reload() {
+        let now = Instant::now();
+        assert_eq!(
+            due_maintenance(
+                now,
+                now - Duration::from_secs(1),
+                now - Duration::from_secs(1),
+                Some(now - MAINTENANCE_IDLE_FOR),
+            ),
+            Some(MaintenanceAction::Restart)
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1045,6 +1085,166 @@ const WHATSAPP_PATCHES_JS: &str = r#"
   })();
 "#;
 
+fn due_maintenance(
+    now: Instant,
+    next_reload: Instant,
+    next_restart: Instant,
+    inactive_since: Option<Instant>,
+) -> Option<MaintenanceAction> {
+    if !inactive_since
+        .map(|since| now.duration_since(since) >= MAINTENANCE_IDLE_FOR)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    if now >= next_restart {
+        Some(MaintenanceAction::Restart)
+    } else if now >= next_reload {
+        Some(MaintenanceAction::Reload)
+    } else {
+        None
+    }
+}
+
+fn main_window_is_inactive(win: &tauri::WebviewWindow) -> bool {
+    let focused = win.is_focused().unwrap_or(true);
+    let visible = win.is_visible().unwrap_or(true);
+    let minimized = win.is_minimized().unwrap_or(false);
+    !focused || !visible || minimized
+}
+
+fn whatsapp_patches_script() -> String {
+    WHATSAPP_PATCHES_JS.replace("__WA_LITE_LOGO_B64__", &{
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("../../WhatsApp Lite Logo.png"))
+    })
+}
+
+fn allow_whatsapp_navigation(app: tauri::AppHandle, url: &tauri::Url) -> bool {
+    let host = url.host_str().unwrap_or("");
+    let allowed = host == "web.whatsapp.com"
+        || host == "whatsapp.com"
+        || host.ends_with(".whatsapp.com")
+        || host.ends_with(".whatsapp.net");
+    if !allowed {
+        let _ = app.opener().open_url(url.as_str(), None::<&str>);
+    }
+    allowed
+}
+
+fn install_close_to_tray(main_window: &tauri::WebviewWindow) {
+    let win_handle = main_window.app_handle().clone();
+    main_window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Some(win) = win_handle.get_webview_window("main") {
+                let _ = win.hide();
+            }
+        }
+    });
+}
+
+fn create_main_window(
+    app: &tauri::AppHandle,
+    visible: bool,
+    focused: bool,
+) -> tauri::Result<tauri::WebviewWindow> {
+    let nav_app_handle = app.clone();
+    let main_window = WebviewWindowBuilder::new(
+        app,
+        "main",
+        WebviewUrl::External("https://web.whatsapp.com".parse().unwrap()),
+    )
+    .title("WhatsAppLite")
+    .inner_size(1100.0, 720.0)
+    .min_inner_size(780.0, 480.0)
+    .center()
+    .decorations(true)
+    .resizable(true)
+    .visible(visible)
+    .focused(focused)
+    .disable_drag_drop_handler()
+    .initialization_script(&whatsapp_patches_script())
+    .on_navigation(move |url| allow_whatsapp_navigation(nav_app_handle.clone(), url))
+    .build()?;
+
+    install_close_to_tray(&main_window);
+    Ok(main_window)
+}
+
+fn restart_main_webview(app: &tauri::AppHandle) -> Result<(), String> {
+    let old = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Janela principal nao encontrada".to_string())?;
+    let was_visible = old.is_visible().unwrap_or(false);
+    let was_minimized = old.is_minimized().unwrap_or(false);
+    let show_new = was_visible && !was_minimized;
+
+    old.destroy()
+        .map_err(|e| format!("Falha ao destruir WebView antiga: {e}"))?;
+
+    // ponytail: short wait for Tauri to free the "main" label after destroy.
+    for _ in 0..10 {
+        if app.get_webview_window("main").is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let new = create_main_window(app, show_new, false)
+        .map_err(|e| format!("Falha ao recriar WebView: {e}"))?;
+    if was_minimized {
+        let _ = new.minimize();
+    }
+    if !was_visible {
+        let _ = new.hide();
+    }
+    Ok(())
+}
+
+fn start_webview_maintenance(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let mut next_reload = Instant::now() + AUTO_RELOAD_EVERY;
+        let mut next_restart = Instant::now() + WEBVIEW_RESTART_EVERY;
+        let mut inactive_since: Option<Instant> = None;
+
+        loop {
+            std::thread::sleep(MAINTENANCE_POLL_EVERY);
+
+            let now = Instant::now();
+            let Some(win) = app.get_webview_window("main") else {
+                inactive_since = None;
+                continue;
+            };
+
+            if main_window_is_inactive(&win) {
+                inactive_since.get_or_insert(now);
+            } else {
+                inactive_since = None;
+            }
+
+            match due_maintenance(now, next_reload, next_restart, inactive_since) {
+                Some(MaintenanceAction::Restart) => {
+                    if restart_main_webview(&app).is_ok() {
+                        let done = Instant::now();
+                        next_restart = done + WEBVIEW_RESTART_EVERY;
+                        next_reload = done + AUTO_RELOAD_EVERY;
+                        inactive_since = Some(done);
+                    }
+                }
+                Some(MaintenanceAction::Reload) => {
+                    if win.reload().is_ok() {
+                        next_reload = Instant::now() + AUTO_RELOAD_EVERY;
+                    }
+                }
+                None => {}
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1132,51 +1332,9 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Cria a janela principal com guard de navegação:
-            // qualquer navegação para fora de *.whatsapp.com / *.whatsapp.net
-            // é bloqueada e a URL é aberta no navegador do sistema. Isso impede
-            // que o frame do WhatsApp Web seja redirecionado para facebook.com,
-            // accountscenter.facebook.com etc. via navegação programática do
-            // próprio JS do WhatsApp Web (que o click handler em <a> não pega).
-            let nav_app_handle = app.handle().clone();
-            let main_window = WebviewWindowBuilder::new(
-                app,
-                "main",
-                WebviewUrl::External("https://web.whatsapp.com".parse().unwrap()),
-            )
-            .title("WhatsAppLite")
-            .inner_size(1100.0, 720.0)
-            .min_inner_size(780.0, 480.0)
-            .center()
-            .decorations(true)
-            .resizable(true)
-            .disable_drag_drop_handler()
-            // initialization_script roda em document_start, antes de qualquer
-            // script do WhatsApp Web. Isso garante que o proxy do Notification
-            // já esteja instalado quando o bundle deles consultar permission
-            // ou chamar `new Notification(...)`. Substitui a antiga thread que
-            // ficava injetando via eval em loop.
-            .initialization_script(&WHATSAPP_PATCHES_JS.replace(
-                "__WA_LITE_LOGO_B64__",
-                &{
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD
-                        .encode(include_bytes!("../../WhatsApp Lite Logo.png"))
-                },
-            ))
-            .on_navigation(move |url| {
-                let host = url.host_str().unwrap_or("");
-                let allowed = host == "web.whatsapp.com"
-                    || host == "whatsapp.com"
-                    || host.ends_with(".whatsapp.com")
-                    || host.ends_with(".whatsapp.net");
-                if !allowed {
-                    let url_str = url.to_string();
-                    let _ = nav_app_handle.opener().open_url(&url_str, None::<&str>);
-                }
-                allowed
-            })
-            .build()?;
+            // Cria a janela principal com guard de navegacao e patch JS em document_start.
+            let app_handle = app.handle().clone();
+            let main_window = create_main_window(&app_handle, !start_hidden, !start_hidden)?;
 
             // Devtools opcional: setar WA_LITE_DEVTOOLS=1 no ambiente abre
             // automaticamente. Sem isso, F12 também funciona (a feature
@@ -1185,21 +1343,7 @@ pub fn run() {
                 main_window.open_devtools();
             }
 
-            // Se iniciou com --hidden, esconde a janela (fica só na tray)
-            if start_hidden {
-                let _ = main_window.hide();
-            }
-
-            // Minimiza para tray ao invés de fechar
-            let win_handle = main_window.app_handle().clone();
-            main_window.on_window_event(move |event| {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    if let Some(win) = win_handle.get_webview_window("main") {
-                        let _ = win.hide();
-                    }
-                }
-            });
+            start_webview_maintenance(app_handle);
 
             Ok(())
         })
