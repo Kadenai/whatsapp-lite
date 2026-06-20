@@ -1,6 +1,6 @@
 use tauri::{
     image::Image,
-    menu::{MenuBuilder, MenuItemBuilder, CheckMenuItemBuilder},
+    menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
@@ -26,6 +26,13 @@ const MAINTENANCE_POLL_EVERY: Duration = Duration::from_secs(10);
 enum MaintenanceAction {
     Reload,
     Restart,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationAction {
+    Allow,
+    OpenExternal,
+    Block,
 }
 
 fn original_extension(name: &str) -> Option<String> {
@@ -457,6 +464,21 @@ mod tests {
             ),
             Some(MaintenanceAction::Restart)
         );
+    }
+
+    #[test]
+    fn navigation_blocks_about_blank_without_opener() {
+        let url = tauri::Url::parse("about:blank").unwrap();
+        assert_eq!(navigation_action(&url), NavigationAction::Block);
+    }
+
+    #[test]
+    fn navigation_opens_only_external_http_urls() {
+        let whatsapp = tauri::Url::parse("https://web.whatsapp.com/").unwrap();
+        let external = tauri::Url::parse("https://example.com/").unwrap();
+
+        assert_eq!(navigation_action(&whatsapp), NavigationAction::Allow);
+        assert_eq!(navigation_action(&external), NavigationAction::OpenExternal);
     }
 
     #[cfg(target_os = "windows")]
@@ -1122,16 +1144,33 @@ fn whatsapp_patches_script() -> String {
     })
 }
 
-fn allow_whatsapp_navigation(app: tauri::AppHandle, url: &tauri::Url) -> bool {
+fn navigation_action(url: &tauri::Url) -> NavigationAction {
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return NavigationAction::Block;
+    }
+
     let host = url.host_str().unwrap_or("");
-    let allowed = host == "web.whatsapp.com"
+    if host == "web.whatsapp.com"
         || host == "whatsapp.com"
         || host.ends_with(".whatsapp.com")
-        || host.ends_with(".whatsapp.net");
-    if !allowed {
-        let _ = app.opener().open_url(url.as_str(), None::<&str>);
+        || host.ends_with(".whatsapp.net")
+    {
+        NavigationAction::Allow
+    } else {
+        NavigationAction::OpenExternal
     }
-    allowed
+}
+
+fn allow_whatsapp_navigation(app: tauri::AppHandle, url: &tauri::Url) -> bool {
+    match navigation_action(url) {
+        NavigationAction::Allow => true,
+        NavigationAction::OpenExternal => {
+            let _ = app.opener().open_url(url.as_str(), None::<&str>);
+            false
+        }
+        NavigationAction::Block => false,
+    }
 }
 
 fn install_close_to_tray(main_window: &tauri::WebviewWindow) {
@@ -1272,10 +1311,8 @@ pub fn run() {
             // enxuta. Custo: <50ms no startup.
             cleanup_old_avatar_temp_files();
 
-            // Habilita o autostart na primeira execução
             use tauri_plugin_autostart::ManagerExt;
             let autostart = app.autolaunch();
-            let _ = autostart.enable();
 
             // Verifica se foi iniciado com --hidden (autostart)
             let args: Vec<String> = std::env::args().collect();
@@ -1287,22 +1324,28 @@ pub fn run() {
 
             // Menu de contexto do tray
             let is_autostart = autostart.is_enabled().unwrap_or(false);
-            let autostart_item = CheckMenuItemBuilder::with_id("autostart", "Iniciar com o sistema")
-                .checked(is_autostart)
-                .build(app)?;
+            let show_item = MenuItemBuilder::with_id("show", "Abrir").build(app)?;
+            let autostart_item =
+                CheckMenuItemBuilder::with_id("autostart", "Iniciar com o sistema")
+                    .checked(is_autostart)
+                    .build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Sair").build(app)?;
             let tray_menu = MenuBuilder::new(app)
+                .item(&show_item)
                 .item(&autostart_item)
                 .item(&quit_item)
                 .build()?;
 
             // Tray icon
+            let autostart_item_for_menu = autostart_item.clone();
             let _tray = TrayIconBuilder::new()
                 .icon(icon)
                 .tooltip("WhatsApp Lite")
                 .menu(&tray_menu)
-                .on_menu_event(|app, event| {
-                    if event.id() == "quit" {
+                .on_menu_event(move |app, event| {
+                    if event.id() == "show" {
+                        focus_main_window(app.clone());
+                    } else if event.id() == "quit" {
                         app.exit(0);
                     } else if event.id() == "autostart" {
                         use tauri_plugin_autostart::ManagerExt;
@@ -1313,6 +1356,8 @@ pub fn run() {
                         } else {
                             let _ = autostart.enable();
                         }
+                        let _ = autostart_item_for_menu
+                            .set_checked(autostart.is_enabled().unwrap_or(false));
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -1322,12 +1367,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.show();
-                            let _ = win.unminimize();
-                            let _ = win.set_focus();
-                        }
+                        focus_main_window(tray.app_handle().clone());
                     }
                 })
                 .build(app)?;

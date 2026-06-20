@@ -102,7 +102,7 @@ Para conferir se o arquivo baixado bate com o release:
 
 ```powershell
 Get-FileHash .\WhatsAppLite.exe -Algorithm SHA256
-Get-FileHash .\WhatsAppLite_1.0.3_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\WhatsAppLite_1.0.4_x64-setup.exe -Algorithm SHA256
 ```
 
 No Linux:
