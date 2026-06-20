@@ -138,6 +138,63 @@ fn quiet_hours_state_blocks_notifications(state: Option<u32>) -> bool {
 }
 
 #[cfg(target_os = "windows")]
+fn utf16le_contains_ascii(data: &[u8], needle: &str) -> bool {
+    let pattern: Vec<u8> = needle.bytes().flat_map(|b| [b, 0]).collect();
+    data.windows(pattern.len())
+        .any(|chunk| chunk == pattern.as_slice())
+}
+
+#[cfg(target_os = "windows")]
+fn cloudstore_quiet_hours_blocks_notifications(data: &[u8]) -> Option<bool> {
+    if utf16le_contains_ascii(data, "Microsoft.QuietHoursProfile.PriorityOnly")
+        || utf16le_contains_ascii(data, "Microsoft.QuietHoursProfile.AlarmsOnly")
+    {
+        Some(true)
+    } else if utf16le_contains_ascii(data, "Microsoft.QuietHoursProfile.Unrestricted") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_cloudstore_quiet_hours_settings() -> Option<Vec<u8>> {
+    use windows::{
+        core::HSTRING,
+        Win32::System::Registry::{
+            RegGetValueW, HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_BINARY,
+        },
+    };
+
+    let mut data = vec![0u8; 512];
+    let mut data_size = data.len() as u32;
+    let mut value_type = REG_VALUE_TYPE::default();
+    let subkey = HSTRING::from(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.donotdisturb.quiethourssettings\\windows.data.donotdisturb.quiethourssettings",
+    );
+    let value_name = HSTRING::from("Data");
+
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &subkey,
+            &value_name,
+            RRF_RT_REG_BINARY,
+            Some(&mut value_type),
+            Some(data.as_mut_ptr().cast()),
+            Some(&mut data_size),
+        )
+    };
+
+    if status.0 != 0 {
+        return None;
+    }
+
+    data.truncate(data_size as usize);
+    Some(data)
+}
+
+#[cfg(target_os = "windows")]
 fn read_quiet_hours_service_state() -> Option<u32> {
     use windows::{
         core::HSTRING,
@@ -169,6 +226,12 @@ fn read_quiet_hours_service_state() -> Option<u32> {
 
 #[cfg(target_os = "windows")]
 fn windows_do_not_disturb_enabled() -> bool {
+    if let Some(blocked) = read_cloudstore_quiet_hours_settings()
+        .and_then(|data| cloudstore_quiet_hours_blocks_notifications(&data))
+    {
+        return blocked;
+    }
+
     quiet_hours_state_blocks_notifications(read_quiet_hours_service_state())
 }
 
@@ -488,6 +551,37 @@ mod tests {
         assert!(!quiet_hours_state_blocks_notifications(Some(0)));
         assert!(quiet_hours_state_blocks_notifications(Some(1)));
         assert!(quiet_hours_state_blocks_notifications(Some(2)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cloudstore_quiet_hours_blocks_only_restricted_profiles() {
+        fn utf16le(s: &str) -> Vec<u8> {
+            s.bytes().flat_map(|b| [b, 0]).collect()
+        }
+
+        assert_eq!(
+            cloudstore_quiet_hours_blocks_notifications(&utf16le(
+                "Microsoft.QuietHoursProfile.PriorityOnly"
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            cloudstore_quiet_hours_blocks_notifications(&utf16le(
+                "Microsoft.QuietHoursProfile.AlarmsOnly"
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            cloudstore_quiet_hours_blocks_notifications(&utf16le(
+                "Microsoft.QuietHoursProfile.Unrestricted"
+            )),
+            Some(false)
+        );
+        assert_eq!(
+            cloudstore_quiet_hours_blocks_notifications(b"no profile"),
+            None
+        );
     }
 }
 
