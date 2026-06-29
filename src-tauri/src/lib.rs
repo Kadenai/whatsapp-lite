@@ -22,6 +22,19 @@ const WEBVIEW_RESTART_EVERY: Duration = Duration::from_secs(4 * 60 * 60);
 const MAINTENANCE_IDLE_FOR: Duration = Duration::from_secs(3 * 60);
 const MAINTENANCE_POLL_EVERY: Duration = Duration::from_secs(10);
 
+// Argumentos extras pro WebView2 (Windows). Sem isso, o Chromium trata a janela
+// escondida (na bandeja / minimizada) como ocluída e estrangula o renderer:
+// congela timers, rebaixa prioridade do processo e a detecção de oclusão nativa
+// pausa o pintar. Resultado: o reload/restart automático que roda com a janela
+// escondida carrega pela metade, e ao abrir você espera o WhatsApp terminar de
+// bootar. Desligando occlusion + backgrounding, o WhatsApp Web carrega em
+// velocidade total mesmo escondido e a janela já abre pronta.
+//
+// O `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection` é o default
+// do wry; additional_browser_args SUBSTITUI esse default, então repetimos aqui
+// (e só então acrescentamos CalculateNativeWinOcclusion). No-op fora do Windows.
+const WEBVIEW2_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MaintenanceAction {
     Reload,
@@ -1298,6 +1311,7 @@ fn create_main_window(
     .resizable(true)
     .visible(visible)
     .focused(focused)
+    .additional_browser_args(WEBVIEW2_BROWSER_ARGS)
     .disable_drag_drop_handler()
     .initialization_script(&whatsapp_patches_script())
     .on_navigation(move |url| allow_whatsapp_navigation(nav_app_handle.clone(), url))
