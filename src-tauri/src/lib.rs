@@ -17,7 +17,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-const AUTO_RELOAD_EVERY: Duration = Duration::from_secs(60 * 60);
+// Nunca recarrega mais cedo que isto desde o último reload — evita churn de
+// re-sync/rede mesmo se a memória disparar logo depois de recarregar.
+const RELOAD_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
+// Teto de segurança: recarrega mesmo sem pressão de memória (ou quando a engine
+// não reporta heap, ex.: WebKitGTK no Linux) depois deste tempo aberto.
+const RELOAD_MAX_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+// Heap JS reportado pela página (via `performance.memory`) acima disto conta
+// como pressão de memória e agenda um reload assim que o usuário ficar ocioso.
+// WhatsApp Web idle fica em ~200-350 MB e sobe com o vazamento; 500 é folgado.
+const HEAP_RELOAD_THRESHOLD_MB: u64 = 500;
 // Escondida na bandeja / minimizada: ninguém está olhando, 3 min bastam.
 const MAINTENANCE_IDLE_HIDDEN_FOR: Duration = Duration::from_secs(3 * 60);
 // Visível mas sem foco (ex.: segundo monitor): o usuário pode estar lendo,
@@ -38,10 +47,25 @@ const MAINTENANCE_POLL_EVERY: Duration = Duration::from_secs(10);
 // (e só então acrescentamos CalculateNativeWinOcclusion). No-op fora do Windows.
 const WEBVIEW2_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows";
 
-/// `true` enquanto o WhatsApp Web tem uma chamada de voz/vídeo em curso
-/// (reportado pelo hook de RTCPeerConnection no JS injetado). A manutenção
-/// nunca recarrega a página durante uma chamada — derrubaria a ligação.
-struct CallState(std::sync::atomic::AtomicBool);
+/// Estado compartilhado entre o JS injetado e a thread de manutenção.
+struct RuntimeState {
+    /// `true` enquanto o WhatsApp Web tem uma chamada de voz/vídeo em curso
+    /// (reportado pelo hook de RTCPeerConnection no JS). A manutenção nunca
+    /// recarrega durante uma chamada — derrubaria a ligação.
+    call_active: std::sync::atomic::AtomicBool,
+    /// Último tamanho do heap JS reportado pela página, em MB. `performance.memory`
+    /// só existe no Chromium/WebView2; sem ele fica 0 e o reload cai no teto de tempo.
+    heap_mb: std::sync::atomic::AtomicU64,
+}
+
+impl RuntimeState {
+    fn new() -> Self {
+        Self {
+            call_active: std::sync::atomic::AtomicBool::new(false),
+            heap_mb: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavigationAction {
@@ -114,14 +138,38 @@ fn prepare_binary_file(path: String) -> Result<(), String> {
         .map_err(|e| format!("Falha ao preparar arquivo para escrita: {e}"))
 }
 
+/// Anexa um chunk de download ao arquivo. Recebe os bytes como corpo BRUTO da
+/// IPC (não como array JSON): o JS passa um `ArrayBuffer`, que o Tauri entrega
+/// em `InvokeBody::Raw`. Isso evita serializar milhões de números por MB — o
+/// caminho antigo (`Array.from` + JSON) travava a UI em arquivos grandes. O
+/// caminho de destino vem no header `x-wa-path` (base64 de UTF-8, porque header
+/// só aceita ASCII e o caminho pode ter acentos).
 #[tauri::command]
-fn append_binary_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
+fn append_binary_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    use base64::Engine as _;
+
+    let encoded = request
+        .headers()
+        .get("x-wa-path")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| "Header x-wa-path ausente".to_string())?;
+    let path_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("Header x-wa-path invalido: {e}"))?;
+    let path = String::from_utf8(path_bytes)
+        .map_err(|e| format!("Caminho de destino invalido: {e}"))?;
+
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b.as_slice(),
+        _ => return Err("Corpo da requisicao nao e binario".to_string()),
+    };
+
     let mut file = OpenOptions::new()
         .append(true)
         .open(&path)
         .map_err(|e| format!("Falha ao abrir arquivo para append: {e}"))?;
 
-    file.write_all(&bytes)
+    file.write_all(bytes)
         .map_err(|e| format!("Falha ao escrever bytes no arquivo: {e}"))
 }
 
@@ -139,8 +187,15 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_call_active(state: tauri::State<'_, CallState>, active: bool) {
-    state.0.store(active, std::sync::atomic::Ordering::Relaxed);
+fn set_call_active(state: tauri::State<'_, RuntimeState>, active: bool) {
+    state
+        .call_active
+        .store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn report_heap_mb(state: tauri::State<'_, RuntimeState>, mb: u64) {
+    state.heap_mb.store(mb, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -521,20 +576,30 @@ mod tests {
         assert!(path.ends_with(r"novo_nome.txt"));
     }
 
+    // Passou do intervalo mínimo desde o último reload (pré-condição comum).
+    fn past_min(now: Instant) -> Instant {
+        now - RELOAD_MIN_INTERVAL
+    }
+
     #[test]
     fn reload_waits_for_hidden_grace() {
         let now = Instant::now();
-        let due = now - Duration::from_secs(1);
+        let last = past_min(now);
+        let high_heap = HEAP_RELOAD_THRESHOLD_MB;
+        // Escondida há pouco (179s < 3min): ainda não.
         assert!(!due_reload(
             now,
-            due,
+            last,
+            high_heap,
             Some(now - Duration::from_secs(179)),
             None,
             false,
         ));
+        // Escondida tempo suficiente + heap alto: recarrega.
         assert!(due_reload(
             now,
-            due,
+            last,
+            high_heap,
             Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
             None,
             false,
@@ -544,17 +609,22 @@ mod tests {
     #[test]
     fn reload_needs_longer_grace_when_visible_but_unfocused() {
         let now = Instant::now();
-        let due = now - Duration::from_secs(1);
+        let last = past_min(now);
+        let high_heap = HEAP_RELOAD_THRESHOLD_MB;
+        // Sem foco há só 3min (grace de escondida): insuficiente pra janela visível.
         assert!(!due_reload(
             now,
-            due,
+            last,
+            high_heap,
             None,
             Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
             false,
         ));
+        // Sem foco há 20min: recarrega.
         assert!(due_reload(
             now,
-            due,
+            last,
+            high_heap,
             None,
             Some(now - MAINTENANCE_IDLE_UNFOCUSED_FOR),
             false,
@@ -566,7 +636,8 @@ mod tests {
         let now = Instant::now();
         assert!(!due_reload(
             now,
-            now - Duration::from_secs(1),
+            now - RELOAD_MAX_INTERVAL,
+            HEAP_RELOAD_THRESHOLD_MB,
             Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
             Some(now - MAINTENANCE_IDLE_UNFOCUSED_FOR),
             true,
@@ -574,12 +645,56 @@ mod tests {
     }
 
     #[test]
-    fn reload_waits_for_schedule() {
+    fn reload_respects_min_interval() {
         let now = Instant::now();
+        // Recarregou agora há pouco: nem heap alto força reload cedo demais.
         assert!(!due_reload(
             now,
-            now + Duration::from_secs(1),
+            now - Duration::from_secs(60),
+            HEAP_RELOAD_THRESHOLD_MB + 1000,
             Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn reload_skips_when_memory_ok_before_ceiling() {
+        let now = Instant::now();
+        // Passou do mínimo, ocioso, mas heap baixo e ainda longe do teto: não recarrega.
+        assert!(!due_reload(
+            now,
+            past_min(now),
+            HEAP_RELOAD_THRESHOLD_MB - 1,
+            Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn reload_ceiling_fires_without_memory_signal() {
+        let now = Instant::now();
+        // Heap 0 (engine sem performance.memory) mas passou do teto de tempo: recarrega.
+        assert!(due_reload(
+            now,
+            now - RELOAD_MAX_INTERVAL,
+            0,
+            Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn reload_needs_idle_even_under_memory_pressure() {
+        let now = Instant::now();
+        // Heap altíssimo, passou do mínimo, mas usuário ativo (nada ocioso): não recarrega.
+        assert!(!due_reload(
+            now,
+            past_min(now),
+            HEAP_RELOAD_THRESHOLD_MB + 2000,
+            None,
             None,
             false,
         ));
@@ -671,6 +786,30 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                 return window.__TAURI__.core.invoke(cmd, payload || {});
             }
             throw new Error('Tauri invoke indisponivel');
+        };
+
+        // Invoca passando um ArrayBuffer como corpo BRUTO da IPC (sem virar array
+        // JSON). Usado no download pra transferir os bytes sem serializar milhões
+        // de números por MB. `headers` leva metadados (ex.: caminho do arquivo).
+        const tauriInvokeRaw = async (cmd, buffer, headers) => {
+            const internals = window.__TAURI_INTERNALS__;
+            const opts = headers ? { headers } : undefined;
+            if (internals && typeof internals.invoke === 'function') {
+                return internals.invoke(cmd, buffer, opts);
+            }
+            if (window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function') {
+                return window.__TAURI__.core.invoke(cmd, buffer, opts);
+            }
+            throw new Error('Tauri invoke indisponivel');
+        };
+
+        // Header HTTP só aceita ASCII; o caminho pode ter acentos. Base64 de
+        // UTF-8 (o Rust decodifica de volta pra String).
+        const __waPathToHeader = (p) => {
+            const utf8 = new TextEncoder().encode(String(p));
+            let bin = '';
+            for (let i = 0; i < utf8.length; i++) bin += String.fromCharCode(utf8[i]);
+            return btoa(bin);
         };
 
         // === Proxy do Notification ==============================================
@@ -850,6 +989,27 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                 try { Object.setPrototypeOf(PatchedRTC, __waOrigRTC); } catch (_) {}
                 window.RTCPeerConnection = PatchedRTC;
             }
+        }
+
+        // === Reporte de heap JS pro Rust ===
+        // A manutenção decide recarregar por PRESSÃO DE MEMÓRIA (o vazamento
+        // real do WhatsApp Web), não só pelo relógio. `performance.memory` é do
+        // Chromium/WebView2; onde não existe (ex.: WebKitGTK), ficamos sem sinal
+        // e a manutenção cai no teto de tempo. Reporta a cada 30s; cada reload
+        // reinicia esta página, então o valor volta a refletir o heap limpo.
+        if (!window.__whatsapp_lite_heap_report_installed
+            && window.performance && performance.memory) {
+            window.__whatsapp_lite_heap_report_installed = true;
+            const __waReportHeap = () => {
+                try {
+                    const used = performance.memory.usedJSHeapSize || 0;
+                    tauriInvoke('report_heap_mb', {
+                        mb: Math.round(used / (1024 * 1024))
+                    }).catch(() => {});
+                } catch (_) {}
+            };
+            __waReportHeap();
+            setInterval(__waReportHeap, 30000);
         }
 
         // === Atalhos de teclado ===
@@ -1096,22 +1256,28 @@ const WHATSAPP_PATCHES_JS: &str = r#"
 
                 await tauriInvoke('prepare_binary_file', { path: selectedPath });
 
+                const pathHeader = __waPathToHeader(selectedPath);
+                const appendChunk = (view) => {
+                    // Manda o ArrayBuffer exato do chunk (sem cópia quando a view
+                    // já cobre o buffer inteiro).
+                    const ab = (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength)
+                        ? view.buffer
+                        : view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+                    return tauriInvokeRaw('append_binary_file', ab, { 'x-wa-path': pathHeader });
+                };
+
                 if (response.body && response.body.getReader) {
                     const reader = response.body.getReader();
                     while (true) {
                         const part = await reader.read();
                         if (part.done) break;
                         if (part.value && part.value.length) {
-                            await tauriInvoke('append_binary_file', {
-                                path: selectedPath,
-                                bytes: Array.from(part.value)
-                            });
+                            await appendChunk(part.value);
                         }
                     }
                 } else {
                     const buffer = await response.arrayBuffer();
-                    const bytes = Array.from(new Uint8Array(buffer));
-                    await tauriInvoke('append_binary_file', { path: selectedPath, bytes });
+                    await appendChunk(new Uint8Array(buffer));
                 }
             };
 
@@ -1298,11 +1464,51 @@ const WHATSAPP_PATCHES_JS: &str = r#"
         window.__waLiteReplaceBanner = __waReplaceBanner;
         window.__waLiteFindCard = __waFindBannerCard;
 
-        new MutationObserver(() => {
+        // O WhatsApp Web muta o DOM continuamente (typing, timestamps, lista de
+        // conversas). O observer antigo rodava __waFindBannerCard() — um
+        // querySelectorAll do documento inteiro + regex por nó — a CADA mutação,
+        // queimando CPU o tempo todo. Agora:
+        //  1) pré-filtro barato: só reagimos quando alguma mutação de fato
+        //     adiciona um nó cujo texto casa com o padrão do banner;
+        //  2) coalescência: agenda no máximo um scan por período ocioso, fora do
+        //     caminho de pintura (requestIdleCallback).
+        // Trocamos a substituição "antes de pintar" por um flash raríssimo do
+        // card — troca barata pelo ganho contínuo de CPU.
+        let __waScanScheduled = false;
+        const __waRunScan = () => {
+            __waScanScheduled = false;
             try { __waReplaceBanner(); } catch (e) {}
+        };
+        const __waScheduleScan = () => {
+            if (__waScanScheduled) return;
+            __waScanScheduled = true;
+            if (typeof window.requestIdleCallback === 'function') {
+                window.requestIdleCallback(__waRunScan, { timeout: 1500 });
+            } else {
+                setTimeout(__waRunScan, 400);
+            }
+        };
+        const __waMutationsHaveCandidate = (mutations) => {
+            for (const m of mutations) {
+                const added = m.addedNodes;
+                for (let i = 0; i < added.length; i++) {
+                    const node = added[i];
+                    if (!node || node.nodeType !== 1) continue; // só elementos
+                    const t = node.textContent;
+                    if (!t || t.length < 5) continue;
+                    if (__waTitleRe.test(t) || __waButtonRe.test(t)) return true;
+                }
+            }
+            return false;
+        };
+
+        new MutationObserver((mutations) => {
+            if (__waMutationsHaveCandidate(mutations)) {
+                __waScheduleScan();
+            }
         }).observe(
             document.documentElement || document,
-            { childList: true, characterData: true, subtree: true }
+            { childList: true, subtree: true }
         );
         try { __waReplaceBanner(); } catch (e) {}
 
@@ -1311,15 +1517,30 @@ const WHATSAPP_PATCHES_JS: &str = r#"
 
 fn due_reload(
     now: Instant,
-    next_reload: Instant,
+    last_reload: Instant,
+    heap_mb: u64,
     hidden_since: Option<Instant>,
     unfocused_since: Option<Instant>,
     call_active: bool,
 ) -> bool {
-    if call_active || now < next_reload {
+    if call_active {
         return false;
     }
 
+    let since_reload = now.duration_since(last_reload);
+    if since_reload < RELOAD_MIN_INTERVAL {
+        return false;
+    }
+
+    // Recarrega por pressão de memória (sinal real do vazamento) OU pelo teto de
+    // tempo (rede de segurança). Sem nenhum dos dois, não há motivo pra recarregar.
+    let memory_pressure = heap_mb >= HEAP_RELOAD_THRESHOLD_MB;
+    let ceiling_hit = since_reload >= RELOAD_MAX_INTERVAL;
+    if !memory_pressure && !ceiling_hit {
+        return false;
+    }
+
+    // ...mas só quando o usuário não está olhando.
     let hidden_long_enough = hidden_since
         .map(|since| now.duration_since(since) >= MAINTENANCE_IDLE_HIDDEN_FOR)
         .unwrap_or(false);
@@ -1408,11 +1629,170 @@ fn create_main_window(
     Ok(main_window)
 }
 
+// ============================================================================
+// Gerenciamento de energia / footprint do WebView2 (Windows).
+//
+// Os flags anti-throttling (WEBVIEW2_BROWSER_ARGS) fazem o WhatsApp Web rodar a
+// todo vapor mesmo escondido — ótimo pra abrir instantâneo, ruim pra dividir CPU
+// com outros apps pesados. Estas funções compensam isso: enquanto a janela está
+// escondida na bandeja, pedimos ao WebView2 pra devolver memória e marcamos os
+// processos dele como "modo eficiência" (EcoQoS) pro scheduler do Windows. Ao
+// mostrar, revertemos. Tudo best-effort: qualquer falha é ignorada.
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+fn apply_low_power_mode(win: &tauri::WebviewWindow, low: bool) {
+    let _ = win.with_webview(move |webview| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+        };
+        use windows::core::Interface;
+
+        let core = match webview.controller().CoreWebView2() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        if let Ok(wv19) = core.cast::<ICoreWebView2_19>() {
+            let level = if low {
+                COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+            } else {
+                COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+            };
+            let _ = wv19.SetMemoryUsageTargetLevel(level);
+        }
+
+        let mut browser_pid: u32 = 0;
+        if core.BrowserProcessId(&mut browser_pid).is_ok() && browser_pid != 0 {
+            set_ecoqos_for_tree(browser_pid, low);
+        }
+    });
+}
+
+/// Aplica (ou remove) EcoQoS no processo browser do WebView2 e em todos os
+/// filhos dele (renderers, GPU, utility) — que são quem de fato consome CPU.
+#[cfg(target_os = "windows")]
+fn set_ecoqos_for_tree(browser_pid: u32, eco: bool) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        set_process_ecoqos(browser_pid, eco);
+
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                if entry.th32ParentProcessID == browser_pid {
+                    set_process_ecoqos(entry.th32ProcessID, eco);
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+
+        let _ = CloseHandle(snap);
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn set_process_ecoqos(pid: u32, eco: bool) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE, PROCESS_SET_INFORMATION,
+    };
+
+    let handle = match OpenProcess(PROCESS_SET_INFORMATION, false, pid) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    // ControlMask liga o controle de EXECUTION_SPEED; StateMask=liga/desliga.
+    // eco=false com ControlMask setado força o modo de alta performance (tira
+    // qualquer throttling), revertendo o EcoQoS quando a janela volta.
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: if eco {
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        } else {
+            0
+        },
+    };
+
+    let _ = SetProcessInformation(
+        handle,
+        ProcessPowerThrottling,
+        &state as *const _ as *const core::ffi::c_void,
+        std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+    );
+    let _ = CloseHandle(handle);
+}
+
+/// Limpa APENAS o cache de disco do perfil do WebView2 (mídia acumulada de
+/// conversas). Não toca em cookies/IndexedDB/localStorage — a sessão do
+/// WhatsApp permanece logada. Assíncrono; o handler de conclusão é no-op.
+#[cfg(target_os = "windows")]
+fn clear_webview_disk_cache(win: &tauri::WebviewWindow) {
+    let _ = win.with_webview(|webview| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2Profile2, ICoreWebView2_13,
+            COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+        };
+        use webview2_com::ClearBrowsingDataCompletedHandler;
+        use windows::core::Interface;
+
+        let core = match webview.controller().CoreWebView2() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let wv13 = match core.cast::<ICoreWebView2_13>() {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let profile = match wv13.Profile() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let profile2 = match profile.cast::<ICoreWebView2Profile2>() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let handler = ClearBrowsingDataCompletedHandler::create(Box::new(|_hr| Ok(())));
+        let _ = profile2
+            .ClearBrowsingData(COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE, &handler);
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_low_power_mode(_win: &tauri::WebviewWindow, _low: bool) {}
+
+#[cfg(not(target_os = "windows"))]
+fn clear_webview_disk_cache(_win: &tauri::WebviewWindow) {}
+
 fn start_webview_maintenance(app: tauri::AppHandle) {
     std::thread::spawn(move || {
-        let mut next_reload = Instant::now() + AUTO_RELOAD_EVERY;
+        let mut last_reload = Instant::now();
         let mut hidden_since: Option<Instant> = None;
         let mut unfocused_since: Option<Instant> = None;
+        // `None` até sabermos o estado; força aplicar o modo de energia na 1ª volta.
+        let mut low_power: Option<bool> = None;
 
         loop {
             std::thread::sleep(MAINTENANCE_POLL_EVERY);
@@ -1425,21 +1805,23 @@ fn start_webview_maintenance(app: tauri::AppHandle) {
                 // tray como sempre.
                 hidden_since = None;
                 unfocused_since = None;
+                low_power = None;
                 let handle = app.clone();
                 let _ = app.run_on_main_thread(move || {
                     if handle.get_webview_window("main").is_none() {
                         let _ = create_main_window(&handle, false, false);
                     }
                 });
-                next_reload = Instant::now() + AUTO_RELOAD_EVERY;
+                last_reload = Instant::now();
                 continue;
             };
 
             let visible = win.is_visible().unwrap_or(true);
             let minimized = win.is_minimized().unwrap_or(false);
             let focused = win.is_focused().unwrap_or(true);
+            let hidden = !visible || minimized;
 
-            if !visible || minimized {
+            if hidden {
                 hidden_since.get_or_insert(now);
             } else {
                 hidden_since = None;
@@ -1450,15 +1832,29 @@ fn start_webview_maintenance(app: tauri::AppHandle) {
                 unfocused_since = None;
             }
 
-            let call_active = app
-                .state::<CallState>()
-                .0
-                .load(std::sync::atomic::Ordering::Relaxed);
+            // Modo de baixo consumo enquanto escondido na bandeja/minimizado:
+            // devolve memória e desprioriza os processos do WebView2 pra não
+            // brigar por CPU com outros apps. Só aplica na transição.
+            if low_power != Some(hidden) {
+                apply_low_power_mode(&win, hidden);
+                low_power = Some(hidden);
+            }
 
-            if due_reload(now, next_reload, hidden_since, unfocused_since, call_active)
+            let state = app.state::<RuntimeState>();
+            let call_active = state.call_active.load(std::sync::atomic::Ordering::Relaxed);
+            let heap_mb = state.heap_mb.load(std::sync::atomic::Ordering::Relaxed);
+
+            if due_reload(now, last_reload, heap_mb, hidden_since, unfocused_since, call_active)
                 && win.reload().is_ok()
             {
-                next_reload = Instant::now() + AUTO_RELOAD_EVERY;
+                last_reload = Instant::now();
+                // Zera o heap conhecido: o valor velho (alto) não pode disparar
+                // outro reload antes da página nova reportar o seu.
+                state.heap_mb.store(0, std::sync::atomic::Ordering::Relaxed);
+                // Limpa só o cache de disco (mídia acumulada), sem tocar em
+                // cookies/IndexedDB — não desloga. Casado com o reload pra
+                // manter o perfil do WebView2 enxuto ao longo do tempo.
+                clear_webview_disk_cache(&win);
             }
         }
     });
@@ -1485,7 +1881,7 @@ pub fn run() {
             Some(vec!["--hidden"]),
         ))
         .setup(|app| {
-            app.manage(CallState(std::sync::atomic::AtomicBool::new(false)));
+            app.manage(RuntimeState::new());
 
             // Limpeza: avatares temporários com mais de 24h ficam órfãos quando o
             // usuário conversa com gente nova e nunca mais com a antiga. Não é
@@ -1576,7 +1972,8 @@ pub fn run() {
             open_external_url,
             focus_main_window,
             send_notification,
-            set_call_active
+            set_call_active,
+            report_heap_mb
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
