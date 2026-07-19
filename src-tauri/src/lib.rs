@@ -198,6 +198,22 @@ fn report_heap_mb(state: tauri::State<'_, RuntimeState>, mb: u64) {
     state.heap_mb.store(mb, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Mesma checagem usada por `send_notification` pra pular o toast — exposta ao
+/// JS pra que o proprio WhatsApp Web possa silenciar o som de notificacao que
+/// ele toca por conta propria (independente da Notification API, que ja
+/// suprimimos no toast nativo).
+#[tauri::command]
+fn is_do_not_disturb() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows_do_not_disturb_enabled()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 #[tauri::command]
 fn focus_main_window(app: tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
@@ -1010,6 +1026,48 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             };
             __waReportHeap();
             setInterval(__waReportHeap, 30000);
+        }
+
+        // === Silenciar som de notificação durante Não Perturbe (Windows) ===
+        // O toast nativo já é suprimido no Rust (send_notification checa o
+        // registro do Focus Assist antes de mostrar), mas o "tin-ting" de nova
+        // mensagem do próprio WhatsApp Web é um efeito sonoro tocado pela
+        // página via <audio>/Audio, TOTALMENTE à parte da Notification API —
+        // continua tocando mesmo com o toast suprimido. Aqui interceptamos
+        // HTMLMediaElement.play (cobre tanto <audio> quanto `new Audio()`) e
+        // bloqueamos apenas o que "parece" um efeito automático de notificação:
+        //   - não veio de um gesto do usuário (sem user activation); e
+        //   - não é mídia em loop (toque de chamada, áudio de fundo).
+        // Assim, tocar um áudio/nota de voz que o usuário clicou continua
+        // funcionando normalmente, e chamadas recebidas (ringtone, loop=true)
+        // não são silenciadas por engano.
+        if (!window.__whatsapp_lite_dnd_mute_installed) {
+            window.__whatsapp_lite_dnd_mute_installed = true;
+
+            let __waDndActive = false;
+            const __waRefreshDnd = () => {
+                tauriInvoke('is_do_not_disturb', {})
+                    .then((active) => { __waDndActive = !!active; })
+                    .catch(() => {});
+            };
+            __waRefreshDnd();
+            setInterval(__waRefreshDnd, 5000);
+
+            const __waHasUserGesture = () => {
+                try {
+                    return !!(navigator.userActivation && navigator.userActivation.isActive);
+                } catch (_) {
+                    return true; // sem suporte a userActivation: nao arrisca silenciar.
+                }
+            };
+
+            const __waOrigPlay = HTMLMediaElement.prototype.play;
+            HTMLMediaElement.prototype.play = function(...args) {
+                if (__waDndActive && !this.loop && !__waHasUserGesture()) {
+                    return Promise.resolve();
+                }
+                return __waOrigPlay.apply(this, args);
+            };
         }
 
         // === Atalhos de teclado ===
@@ -1973,7 +2031,8 @@ pub fn run() {
             focus_main_window,
             send_notification,
             set_call_active,
-            report_heap_mb
+            report_heap_mb,
+            is_do_not_disturb
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
