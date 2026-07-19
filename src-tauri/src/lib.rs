@@ -966,6 +966,8 @@ const WHATSAPP_PATCHES_JS: &str = r#"
 
             let __waActiveCalls = 0;
             const __waReportCalls = () => {
+                // Exposto pro mute de DND: nunca silenciar áudio durante chamada.
+                window.__waLiteCallActive = __waActiveCalls > 0;
                 tauriInvoke('set_call_active', { active: __waActiveCalls > 0 }).catch(() => {});
             };
             // Cada load zera o estado no Rust — se a página morreu no meio de
@@ -1029,18 +1031,25 @@ const WHATSAPP_PATCHES_JS: &str = r#"
         }
 
         // === Silenciar som de notificação durante Não Perturbe (Windows) ===
-        // O toast nativo já é suprimido no Rust (send_notification checa o
-        // registro do Focus Assist antes de mostrar), mas o "tin-ting" de nova
-        // mensagem do próprio WhatsApp Web é um efeito sonoro tocado pela
-        // página via <audio>/Audio, TOTALMENTE à parte da Notification API —
-        // continua tocando mesmo com o toast suprimido. Aqui interceptamos
-        // HTMLMediaElement.play (cobre tanto <audio> quanto `new Audio()`) e
-        // bloqueamos apenas o que "parece" um efeito automático de notificação:
-        //   - não veio de um gesto do usuário (sem user activation); e
-        //   - não é mídia em loop (toque de chamada, áudio de fundo).
-        // Assim, tocar um áudio/nota de voz que o usuário clicou continua
-        // funcionando normalmente, e chamadas recebidas (ringtone, loop=true)
-        // não são silenciadas por engano.
+        // O toast nativo já é suprimido no Rust (send_notification checa o Focus
+        // Assist antes de mostrar), mas o "tin-ting" de nova mensagem é um som
+        // que a PRÓPRIA página toca, à parte da Notification API — continua
+        // saindo com o toast suprimido. WhatsApp Web pode tocar isso por dois
+        // caminhos, então cobrimos os dois:
+        //   1) HTMLMediaElement.play  (<audio> / new Audio())
+        //   2) Web Audio API          (AudioBufferSource/Oscillator.start)
+        //
+        // Só bloqueamos o que "parece" um efeito AUTOMÁTICO: DND ligado, sem
+        // chamada em curso, e sem gesto recente do usuário. Proteções contra
+        // silenciar áudio legítimo:
+        //   - `srcObject` presente => é MediaStream (áudio de chamada / stream
+        //     ao vivo), nunca um chime => nunca silencia;
+        //   - `loop` => ringtone / áudio de fundo => nunca silencia;
+        //   - elemento já tocado com gesto entra numa allow-list (WeakSet), o
+        //     que resgata o autoplay encadeado de notas de voz reutilizando o
+        //     mesmo <audio>;
+        //   - Web Audio: só mexemos em BufferSource/Oscillator (efeitos), que
+        //     não são o caminho de streams de chamada (MediaStreamAudioSource).
         if (!window.__whatsapp_lite_dnd_mute_installed) {
             window.__whatsapp_lite_dnd_mute_installed = true;
 
@@ -1053,21 +1062,57 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             __waRefreshDnd();
             setInterval(__waRefreshDnd, 5000);
 
+            // Gesto do usuário: usa a API nativa quando existe, senão cai num
+            // rastreamento próprio (janela de 5s) — garantindo o discriminador
+            // mesmo onde `navigator.userActivation` não existe (o fallback
+            // antigo retornava "true" e nunca silenciava nada).
+            let __waLastGestureAt = 0;
+            ['pointerdown', 'mousedown', 'keydown', 'touchstart'].forEach((ev) => {
+                window.addEventListener(ev, () => { __waLastGestureAt = Date.now(); }, true);
+            });
             const __waHasUserGesture = () => {
                 try {
-                    return !!(navigator.userActivation && navigator.userActivation.isActive);
-                } catch (_) {
-                    return true; // sem suporte a userActivation: nao arrisca silenciar.
-                }
+                    if (navigator.userActivation) return navigator.userActivation.isActive;
+                } catch (_) {}
+                return (Date.now() - __waLastGestureAt) < 5000;
             };
 
+            // Um único critério compartilhado pelos dois caminhos de áudio.
+            const __waShouldBlockAuto = () =>
+                __waDndActive && !window.__waLiteCallActive && !__waHasUserGesture();
+
+            // --- Caminho 1: HTMLMediaElement --------------------------------
+            const __waApproved = new WeakSet();
             const __waOrigPlay = HTMLMediaElement.prototype.play;
             HTMLMediaElement.prototype.play = function(...args) {
-                if (__waDndActive && !this.loop && !__waHasUserGesture()) {
+                if (__waHasUserGesture()) __waApproved.add(this);
+                if (__waShouldBlockAuto()
+                    && !this.srcObject
+                    && !this.loop
+                    && !__waApproved.has(this)) {
                     return Promise.resolve();
                 }
                 return __waOrigPlay.apply(this, args);
             };
+
+            // --- Caminho 2: Web Audio ---------------------------------------
+            // Em vez de bloquear start() (quebraria start/stop/onended),
+            // desconectamos o nó da saída: ele roda em silêncio mas todo o
+            // maquinário de estado continua normal.
+            const __waPatchScheduledStart = (Ctor) => {
+                if (!Ctor || !Ctor.prototype || typeof Ctor.prototype.start !== 'function') {
+                    return;
+                }
+                const orig = Ctor.prototype.start;
+                Ctor.prototype.start = function(...args) {
+                    if (__waShouldBlockAuto()) {
+                        try { this.disconnect(); } catch (_) {}
+                    }
+                    return orig.apply(this, args);
+                };
+            };
+            __waPatchScheduledStart(window.AudioBufferSourceNode);
+            __waPatchScheduledStart(window.OscillatorNode);
         }
 
         // === Atalhos de teclado ===
