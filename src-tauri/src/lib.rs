@@ -18,8 +18,11 @@ use std::{
 };
 
 const AUTO_RELOAD_EVERY: Duration = Duration::from_secs(60 * 60);
-const WEBVIEW_RESTART_EVERY: Duration = Duration::from_secs(4 * 60 * 60);
-const MAINTENANCE_IDLE_FOR: Duration = Duration::from_secs(3 * 60);
+// Escondida na bandeja / minimizada: ninguém está olhando, 3 min bastam.
+const MAINTENANCE_IDLE_HIDDEN_FOR: Duration = Duration::from_secs(3 * 60);
+// Visível mas sem foco (ex.: segundo monitor): o usuário pode estar lendo,
+// então exige uma ausência bem mais longa antes de recarregar na frente dele.
+const MAINTENANCE_IDLE_UNFOCUSED_FOR: Duration = Duration::from_secs(20 * 60);
 const MAINTENANCE_POLL_EVERY: Duration = Duration::from_secs(10);
 
 // Argumentos extras pro WebView2 (Windows). Sem isso, o Chromium trata a janela
@@ -35,11 +38,10 @@ const MAINTENANCE_POLL_EVERY: Duration = Duration::from_secs(10);
 // (e só então acrescentamos CalculateNativeWinOcclusion). No-op fora do Windows.
 const WEBVIEW2_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MaintenanceAction {
-    Reload,
-    Restart,
-}
+/// `true` enquanto o WhatsApp Web tem uma chamada de voz/vídeo em curso
+/// (reportado pelo hook de RTCPeerConnection no JS injetado). A manutenção
+/// nunca recarrega a página durante uma chamada — derrubaria a ligação.
+struct CallState(std::sync::atomic::AtomicBool);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavigationAction {
@@ -134,6 +136,11 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| format!("Falha ao abrir URL externa: {e}"))
+}
+
+#[tauri::command]
+fn set_call_active(state: tauri::State<'_, CallState>, active: bool) {
+    state.0.store(active, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -515,31 +522,67 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_waits_for_idle_grace() {
+    fn reload_waits_for_hidden_grace() {
         let now = Instant::now();
-        assert_eq!(
-            due_maintenance(
-                now,
-                now - Duration::from_secs(1),
-                now + Duration::from_secs(1),
-                Some(now - Duration::from_secs(179)),
-            ),
-            None
-        );
+        let due = now - Duration::from_secs(1);
+        assert!(!due_reload(
+            now,
+            due,
+            Some(now - Duration::from_secs(179)),
+            None,
+            false,
+        ));
+        assert!(due_reload(
+            now,
+            due,
+            Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
+            None,
+            false,
+        ));
     }
 
     #[test]
-    fn maintenance_restart_wins_over_reload() {
+    fn reload_needs_longer_grace_when_visible_but_unfocused() {
         let now = Instant::now();
-        assert_eq!(
-            due_maintenance(
-                now,
-                now - Duration::from_secs(1),
-                now - Duration::from_secs(1),
-                Some(now - MAINTENANCE_IDLE_FOR),
-            ),
-            Some(MaintenanceAction::Restart)
-        );
+        let due = now - Duration::from_secs(1);
+        assert!(!due_reload(
+            now,
+            due,
+            None,
+            Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
+            false,
+        ));
+        assert!(due_reload(
+            now,
+            due,
+            None,
+            Some(now - MAINTENANCE_IDLE_UNFOCUSED_FOR),
+            false,
+        ));
+    }
+
+    #[test]
+    fn reload_never_runs_during_call() {
+        let now = Instant::now();
+        assert!(!due_reload(
+            now,
+            now - Duration::from_secs(1),
+            Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
+            Some(now - MAINTENANCE_IDLE_UNFOCUSED_FOR),
+            true,
+        ));
+    }
+
+    #[test]
+    fn reload_waits_for_schedule() {
+        let now = Instant::now();
+        assert!(!due_reload(
+            now,
+            now + Duration::from_secs(1),
+            Some(now - MAINTENANCE_IDLE_HIDDEN_FOR),
+            None,
+            false,
+        ));
     }
 
     #[test]
@@ -756,6 +799,58 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             }
             __waNotifs.delete(String(notifId));
         };
+
+        // === Guarda de chamada ativa ===
+        // A manutenção no Rust recarrega a página quando o app fica muito tempo
+        // aberto (o WhatsApp Web vaza memória e começa a travar). Recarregar no
+        // meio de uma chamada de voz/vídeo derrubaria a ligação, então hookamos
+        // o RTCPeerConnection: enquanto houver conexão WebRTC viva, avisamos o
+        // Rust para segurar o reload.
+        if (!window.__whatsapp_lite_call_guard_installed) {
+            window.__whatsapp_lite_call_guard_installed = true;
+
+            let __waActiveCalls = 0;
+            const __waReportCalls = () => {
+                tauriInvoke('set_call_active', { active: __waActiveCalls > 0 }).catch(() => {});
+            };
+            // Cada load zera o estado no Rust — se a página morreu no meio de
+            // uma chamada, o "true" antigo não pode travar a manutenção pra sempre.
+            __waReportCalls();
+
+            const __waOrigRTC = window.RTCPeerConnection;
+            if (typeof __waOrigRTC === 'function') {
+                const PatchedRTC = function(...args) {
+                    const pc = new __waOrigRTC(...args);
+                    __waActiveCalls++;
+                    __waReportCalls();
+
+                    let released = false;
+                    const release = () => {
+                        if (released) return;
+                        released = true;
+                        __waActiveCalls = Math.max(0, __waActiveCalls - 1);
+                        __waReportCalls();
+                    };
+
+                    pc.addEventListener('connectionstatechange', () => {
+                        if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+                            release();
+                        }
+                    });
+
+                    const origClose = pc.close.bind(pc);
+                    pc.close = function() {
+                        release();
+                        return origClose();
+                    };
+
+                    return pc;
+                };
+                PatchedRTC.prototype = __waOrigRTC.prototype;
+                try { Object.setPrototypeOf(PatchedRTC, __waOrigRTC); } catch (_) {}
+                window.RTCPeerConnection = PatchedRTC;
+            }
+        }
 
         // === Atalhos de teclado ===
         if (!window.__whatsapp_lite_shortcuts_installed) {
@@ -1214,33 +1309,25 @@ const WHATSAPP_PATCHES_JS: &str = r#"
   })();
 "#;
 
-fn due_maintenance(
+fn due_reload(
     now: Instant,
     next_reload: Instant,
-    next_restart: Instant,
-    inactive_since: Option<Instant>,
-) -> Option<MaintenanceAction> {
-    if !inactive_since
-        .map(|since| now.duration_since(since) >= MAINTENANCE_IDLE_FOR)
-        .unwrap_or(false)
-    {
-        return None;
+    hidden_since: Option<Instant>,
+    unfocused_since: Option<Instant>,
+    call_active: bool,
+) -> bool {
+    if call_active || now < next_reload {
+        return false;
     }
 
-    if now >= next_restart {
-        Some(MaintenanceAction::Restart)
-    } else if now >= next_reload {
-        Some(MaintenanceAction::Reload)
-    } else {
-        None
-    }
-}
+    let hidden_long_enough = hidden_since
+        .map(|since| now.duration_since(since) >= MAINTENANCE_IDLE_HIDDEN_FOR)
+        .unwrap_or(false);
+    let unfocused_long_enough = unfocused_since
+        .map(|since| now.duration_since(since) >= MAINTENANCE_IDLE_UNFOCUSED_FOR)
+        .unwrap_or(false);
 
-fn main_window_is_inactive(win: &tauri::WebviewWindow) -> bool {
-    let focused = win.is_focused().unwrap_or(true);
-    let visible = win.is_visible().unwrap_or(true);
-    let minimized = win.is_minimized().unwrap_or(false);
-    !focused || !visible || minimized
+    hidden_long_enough || unfocused_long_enough
 }
 
 fn whatsapp_patches_script() -> String {
@@ -1321,72 +1408,57 @@ fn create_main_window(
     Ok(main_window)
 }
 
-fn restart_main_webview(app: &tauri::AppHandle) -> Result<(), String> {
-    let old = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Janela principal nao encontrada".to_string())?;
-    let was_visible = old.is_visible().unwrap_or(false);
-    let was_minimized = old.is_minimized().unwrap_or(false);
-    let show_new = was_visible && !was_minimized;
-
-    old.destroy()
-        .map_err(|e| format!("Falha ao destruir WebView antiga: {e}"))?;
-
-    // ponytail: short wait for Tauri to free the "main" label after destroy.
-    for _ in 0..10 {
-        if app.get_webview_window("main").is_none() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    let new = create_main_window(app, show_new, false)
-        .map_err(|e| format!("Falha ao recriar WebView: {e}"))?;
-    if was_minimized {
-        let _ = new.minimize();
-    }
-    if !was_visible {
-        let _ = new.hide();
-    }
-    Ok(())
-}
-
 fn start_webview_maintenance(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut next_reload = Instant::now() + AUTO_RELOAD_EVERY;
-        let mut next_restart = Instant::now() + WEBVIEW_RESTART_EVERY;
-        let mut inactive_since: Option<Instant> = None;
+        let mut hidden_since: Option<Instant> = None;
+        let mut unfocused_since: Option<Instant> = None;
 
         loop {
             std::thread::sleep(MAINTENANCE_POLL_EVERY);
 
             let now = Instant::now();
             let Some(win) = app.get_webview_window("main") else {
-                inactive_since = None;
+                // Self-heal: a janela só some daqui se a WebView morreu (crash
+                // do WebView2 / kill externo) — o fechar normal apenas esconde.
+                // Recria escondida na thread principal; o usuário reabre pelo
+                // tray como sempre.
+                hidden_since = None;
+                unfocused_since = None;
+                let handle = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if handle.get_webview_window("main").is_none() {
+                        let _ = create_main_window(&handle, false, false);
+                    }
+                });
+                next_reload = Instant::now() + AUTO_RELOAD_EVERY;
                 continue;
             };
 
-            if main_window_is_inactive(&win) {
-                inactive_since.get_or_insert(now);
+            let visible = win.is_visible().unwrap_or(true);
+            let minimized = win.is_minimized().unwrap_or(false);
+            let focused = win.is_focused().unwrap_or(true);
+
+            if !visible || minimized {
+                hidden_since.get_or_insert(now);
             } else {
-                inactive_since = None;
+                hidden_since = None;
+            }
+            if !focused {
+                unfocused_since.get_or_insert(now);
+            } else {
+                unfocused_since = None;
             }
 
-            match due_maintenance(now, next_reload, next_restart, inactive_since) {
-                Some(MaintenanceAction::Restart) => {
-                    if restart_main_webview(&app).is_ok() {
-                        let done = Instant::now();
-                        next_restart = done + WEBVIEW_RESTART_EVERY;
-                        next_reload = done + AUTO_RELOAD_EVERY;
-                        inactive_since = Some(done);
-                    }
-                }
-                Some(MaintenanceAction::Reload) => {
-                    if win.reload().is_ok() {
-                        next_reload = Instant::now() + AUTO_RELOAD_EVERY;
-                    }
-                }
-                None => {}
+            let call_active = app
+                .state::<CallState>()
+                .0
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            if due_reload(now, next_reload, hidden_since, unfocused_since, call_active)
+                && win.reload().is_ok()
+            {
+                next_reload = Instant::now() + AUTO_RELOAD_EVERY;
             }
         }
     });
@@ -1413,6 +1485,8 @@ pub fn run() {
             Some(vec!["--hidden"]),
         ))
         .setup(|app| {
+            app.manage(CallState(std::sync::atomic::AtomicBool::new(false)));
+
             // Limpeza: avatares temporários com mais de 24h ficam órfãos quando o
             // usuário conversa com gente nova e nunca mais com a antiga. Não é
             // crítico (o Windows limpa %TEMP% periodicamente), mas mantém a pasta
@@ -1501,8 +1575,19 @@ pub fn run() {
             append_binary_file,
             open_external_url,
             focus_main_window,
-            send_notification
+            send_notification,
+            set_call_active
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // App de bandeja: destruir a última janela (crash da WebView, kill
+            // externo) não pode encerrar o processo — o Tauri dispararia
+            // ExitRequested com code None e sairia por padrão. Sair de verdade
+            // continua sendo só pelo "Sair" do tray, que usa app.exit(0) e
+            // chega aqui com code Some(0).
+            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }
