@@ -1,2 +1,0 @@
-39e7c3003ff7c6f30893d945417d7d8fe7b2ae995fb639aeb4ccf46d7240bc86  WhatsAppLite.exe
-95644f9a5b23ce05056bd719e3dc7aa4428a9c605d53920a2578dad5fd076bc7  WhatsAppLite_1.0.8_x64-setup.exe
