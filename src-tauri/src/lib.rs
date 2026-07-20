@@ -1039,17 +1039,25 @@ const WHATSAPP_PATCHES_JS: &str = r#"
         //   1) HTMLMediaElement.play  (<audio> / new Audio())
         //   2) Web Audio API          (AudioBufferSource/Oscillator.start)
         //
-        // Só bloqueamos o que "parece" um efeito AUTOMÁTICO: DND ligado, sem
-        // chamada em curso, e sem gesto recente do usuário. Proteções contra
-        // silenciar áudio legítimo:
+        // Só bloqueamos efeitos sonoros AUTOMÁTICOS: DND ligado e sem chamada
+        // em curso. Proteções contra silenciar áudio legítimo:
         //   - `srcObject` presente => é MediaStream (áudio de chamada / stream
         //     ao vivo), nunca um chime => nunca silencia;
         //   - `loop` => ringtone / áudio de fundo => nunca silencia;
-        //   - elemento já tocado com gesto entra numa allow-list (WeakSet), o
-        //     que resgata o autoplay encadeado de notas de voz reutilizando o
-        //     mesmo <audio>;
+        //   - `src` blob: => mídia de conversa (nota de voz, vídeo, áudio),
+        //     que o WhatsApp Web descriptografa na página e serve por
+        //     createObjectURL => nunca silencia. O chime, ao contrário, é um
+        //     asset estático (https:/data:) — é ESSE que bloqueamos.
         //   - Web Audio: só mexemos em BufferSource/Oscillator (efeitos), que
         //     não são o caminho de streams de chamada (MediaStreamAudioSource).
+        //
+        // Nota: as versões anteriores usavam "gesto recente do usuário" (janela
+        // de 5s via navigator.userActivation) + allow-list permanente de
+        // elementos tocados com gesto. Isso vazava o chime exatamente no caso
+        // comum: usuário digitando quando a mensagem chega => cada tecla renova
+        // a ativação => chime passa; e como o WhatsApp reutiliza o mesmo
+        // <audio> pro chime, uma única passada dessas o aprovava pra sempre.
+        // O discriminador por blob: é estrutural e não depende de timing.
         if (!window.__whatsapp_lite_dnd_mute_installed) {
             window.__whatsapp_lite_dnd_mute_installed = true;
 
@@ -1062,51 +1070,60 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             __waRefreshDnd();
             setInterval(__waRefreshDnd, 5000);
 
-            // Gesto do usuário: usa a API nativa quando existe, senão cai num
-            // rastreamento próprio (janela de 5s) — garantindo o discriminador
-            // mesmo onde `navigator.userActivation` não existe (o fallback
-            // antigo retornava "true" e nunca silenciava nada).
-            let __waLastGestureAt = 0;
-            ['pointerdown', 'mousedown', 'keydown', 'touchstart'].forEach((ev) => {
-                window.addEventListener(ev, () => { __waLastGestureAt = Date.now(); }, true);
-            });
-            const __waHasUserGesture = () => {
-                try {
-                    if (navigator.userActivation) return navigator.userActivation.isActive;
-                } catch (_) {}
-                return (Date.now() - __waLastGestureAt) < 5000;
+            // --- Caminho 1: HTMLMediaElement --------------------------------
+            const __waShouldMuteMedia = (el) => {
+                if (!__waDndActive || window.__waLiteCallActive) return false;
+                if (el.srcObject || el.loop || el.muted) return false;
+                const src = String(el.currentSrc || el.src || '');
+                return !src.startsWith('blob:');
             };
 
-            // Um único critério compartilhado pelos dois caminhos de áudio.
-            const __waShouldBlockAuto = () =>
-                __waDndActive && !window.__waLiteCallActive && !__waHasUserGesture();
-
-            // --- Caminho 1: HTMLMediaElement --------------------------------
-            const __waApproved = new WeakSet();
             const __waOrigPlay = HTMLMediaElement.prototype.play;
             HTMLMediaElement.prototype.play = function(...args) {
-                if (__waHasUserGesture()) __waApproved.add(this);
-                if (__waShouldBlockAuto()
-                    && !this.srcObject
-                    && !this.loop
-                    && !__waApproved.has(this)) {
+                if (__waShouldMuteMedia(this)) {
                     return Promise.resolve();
                 }
                 return __waOrigPlay.apply(this, args);
             };
 
+            // Rede extra: cobre playback que começa sem passar pelo play() em
+            // JS (ex.: atributo autoplay) em elementos anexados ao DOM. O
+            // evento 'play' não borbulha, mas captura no document alcança.
+            document.addEventListener('play', (ev) => {
+                const el = ev.target;
+                if (el instanceof HTMLMediaElement && __waShouldMuteMedia(el)) {
+                    try { el.pause(); } catch (_) {}
+                }
+            }, true);
+
             // --- Caminho 2: Web Audio ---------------------------------------
+            // Aqui não existe src pra discriminar, então usamos gesto direto:
+            // efeito disparado por clique/tecla toca; efeito espontâneo (chime)
+            // não. Janela de 1s — curta de propósito: o start() de um efeito
+            // user-initiated acontece no mesmo tick do evento, enquanto um
+            // chime só coincide com um gesto por azar. (A janela antiga de 5s,
+            // renovada a cada tecla, deixava o chime passar sempre que o
+            // usuário estava digitando.)
+            let __waLastGestureAt = 0;
+            ['pointerdown', 'mousedown', 'keydown', 'touchstart'].forEach((ev) => {
+                window.addEventListener(ev, () => { __waLastGestureAt = Date.now(); }, true);
+            });
+            const __waHasDirectGesture = () => (Date.now() - __waLastGestureAt) < 1000;
+
             // Em vez de bloquear start() (quebraria start/stop/onended),
             // desconectamos o nó da saída: ele roda em silêncio mas todo o
-            // maquinário de estado continua normal.
+            // maquinário de estado continua normal. Também neutralizamos o
+            // connect() DESTE nó, senão um `source.start(); source.connect(dest)`
+            // (conectar depois de agendar) reconectaria o som bloqueado.
             const __waPatchScheduledStart = (Ctor) => {
                 if (!Ctor || !Ctor.prototype || typeof Ctor.prototype.start !== 'function') {
                     return;
                 }
                 const orig = Ctor.prototype.start;
                 Ctor.prototype.start = function(...args) {
-                    if (__waShouldBlockAuto()) {
+                    if (__waDndActive && !window.__waLiteCallActive && !__waHasDirectGesture()) {
                         try { this.disconnect(); } catch (_) {}
+                        try { this.connect = function(dest) { return dest; }; } catch (_) {}
                     }
                     return orig.apply(this, args);
                 };
