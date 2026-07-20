@@ -138,12 +138,22 @@ fn prepare_binary_file(path: String) -> Result<(), String> {
         .map_err(|e| format!("Falha ao preparar arquivo para escrita: {e}"))
 }
 
-/// Anexa um chunk de download ao arquivo. Recebe os bytes como corpo BRUTO da
-/// IPC (não como array JSON): o JS passa um `ArrayBuffer`, que o Tauri entrega
-/// em `InvokeBody::Raw`. Isso evita serializar milhões de números por MB — o
-/// caminho antigo (`Array.from` + JSON) travava a UI em arquivos grandes. O
-/// caminho de destino vem no header `x-wa-path` (base64 de UTF-8, porque header
-/// só aceita ASCII e o caminho pode ter acentos).
+/// Aceita o corpo bruto normal e o fallback JSON do Tauri, usado quando a CSP
+/// do WhatsApp bloqueia o protocolo IPC interno.
+fn download_bytes(body: &tauri::ipc::InvokeBody) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    match body {
+        tauri::ipc::InvokeBody::Raw(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
+        tauri::ipc::InvokeBody::Json(serde_json::Value::Array(bytes)) => bytes
+            .iter()
+            .map(|byte| byte.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+            .collect::<Option<Vec<_>>>()
+            .map(std::borrow::Cow::Owned)
+            .ok_or_else(|| "Corpo da requisicao nao contem bytes validos".to_string()),
+        _ => Err("Corpo da requisicao nao e binario".to_string()),
+    }
+}
+
+/// Anexa um chunk de download ao arquivo.
 #[tauri::command]
 fn append_binary_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
     use base64::Engine as _;
@@ -159,18 +169,34 @@ fn append_binary_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
     let path = String::from_utf8(path_bytes)
         .map_err(|e| format!("Caminho de destino invalido: {e}"))?;
 
-    let bytes = match request.body() {
-        tauri::ipc::InvokeBody::Raw(b) => b.as_slice(),
-        _ => return Err("Corpo da requisicao nao e binario".to_string()),
-    };
+    let bytes = download_bytes(request.body())?;
 
     let mut file = OpenOptions::new()
         .append(true)
         .open(&path)
         .map_err(|e| format!("Falha ao abrir arquivo para append: {e}"))?;
 
-    file.write_all(bytes)
+    file.write_all(&bytes)
         .map_err(|e| format!("Falha ao escrever bytes no arquivo: {e}"))
+}
+
+#[cfg(test)]
+#[test]
+fn download_bytes_accepts_raw_and_json() {
+    use tauri::ipc::InvokeBody;
+
+    assert_eq!(
+        download_bytes(&InvokeBody::Raw(vec![1, 2]))
+            .unwrap()
+            .as_ref(),
+        [1, 2]
+    );
+    assert_eq!(
+        download_bytes(&InvokeBody::Json(serde_json::json!([3, 4])))
+            .unwrap()
+            .as_ref(),
+        [3, 4]
+    );
 }
 
 #[tauri::command]
