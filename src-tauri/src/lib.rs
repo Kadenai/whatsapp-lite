@@ -1815,6 +1815,9 @@ fn open_helper_window(app: &tauri::AppHandle, label: &str, page: &str, title: &s
         .title(title)
         .inner_size(420.0, height)
         .resizable(false)
+        // `resizable(false)` sozinho não desativa o botão de maximizar, e
+        // maximizar um formulário deste tamanho só produz um mar de vazio.
+        .maximizable(false)
         .center()
         .additional_browser_args(WEBVIEW2_BROWSER_ARGS);
 

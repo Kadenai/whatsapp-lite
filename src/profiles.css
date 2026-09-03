@@ -13,6 +13,21 @@ html, body {
   font-size: 14px;
 }
 
+/* Rede de seguranca: se o texto quebrar em mais linhas do que o previsto (fonte
+   maior, outra escala de DPI), a janela rola em vez de cortar o botao. */
+body {
+  overflow-y: auto;
+}
+
+/* O atributo `hidden` do HTML vem de uma regra do navegador, e regra de autor
+   ganha de regra do navegador independente de especificidade: qualquer
+   `display` declarado aqui (e `section` e `label` declaram flex) faz o
+   `hidden` parar de esconder. Sem isto, os três passos da tela de boas-vindas
+   aparecem empilhados de uma vez só. */
+[hidden] {
+  display: none !important;
+}
+
 main {
   padding: 24px;
   display: flex;
