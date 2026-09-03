@@ -36,6 +36,11 @@ pub struct Store {
     /// Slug que ainda precisa adotar a pasta legada no próximo boot.
     #[serde(default)]
     pub pending_adopt: Option<String>,
+    /// A tela de boas-vindas já foi respondida. Sem isto ela voltaria a cada
+    /// abertura de quem respondeu "só eu uso" — que é justamente quem não quer
+    /// ouvir falar de perfil nunca mais.
+    #[serde(default)]
+    pub onboarding_done: bool,
 }
 
 impl Store {
@@ -212,6 +217,42 @@ pub fn add(
     save(app, &store).map_err(|err| format!("Falha ao gravar profiles.json: {err}"))
 }
 
+/// Cria o primeiro perfil a partir da tela de boas-vindas.
+///
+/// Diferente de `add`, aqui não há segundo nome a pedir: o perfil criado é o
+/// dono da sessão que já está aberta, então ele é ao mesmo tempo o ativo e o
+/// que vai adotar a pasta legada no boot seguinte. Numa instalação nova não há
+/// pasta pra adotar e a rotina de adoção simplesmente segue em frente.
+pub fn create_first(app: &tauri::AppHandle, name: String) -> Result<(), String> {
+    let mut store = load(app);
+    create_first_in(&mut store, &name)?;
+    save(app, &store).map_err(|err| format!("Falha ao gravar profiles.json: {err}"))
+}
+
+fn create_first_in(store: &mut Store, name: &str) -> Result<(), String> {
+    if !store.profiles.is_empty() {
+        return Err("Já existem perfis criados.".to_string());
+    }
+
+    let name = validate_name(name)?;
+    let slug = slugify(&name, &store.profiles);
+    store.profiles.push(Profile {
+        name,
+        slug: slug.clone(),
+    });
+    store.active = Some(slug.clone());
+    store.pending_adopt = Some(slug);
+    store.onboarding_done = true;
+    Ok(())
+}
+
+/// Registra que a tela de boas-vindas já foi respondida, sem criar perfil.
+pub fn mark_onboarding_done(app: &tauri::AppHandle) -> Result<(), String> {
+    let mut store = load(app);
+    store.onboarding_done = true;
+    save(app, &store).map_err(|err| format!("Falha ao gravar profiles.json: {err}"))
+}
+
 /// Troca o perfil ativo. Quem chama reinicia o app em seguida.
 pub fn set_active(app: &tauri::AppHandle, slug: &str) -> Result<(), String> {
     let mut store = load(app);
@@ -306,5 +347,42 @@ mod tests {
         assert!(validate_name("  ").is_err());
         assert!(validate_name(&"a".repeat(MAX_NAME_LEN + 1)).is_err());
         assert_eq!(validate_name("  Levi  ").unwrap(), "Levi");
+    }
+
+    #[test]
+    fn primeiro_perfil_adota_a_sessao_atual() {
+        let mut store = Store::default();
+        create_first_in(&mut store, "  Levi  ").unwrap();
+
+        assert_eq!(store.profiles.len(), 1);
+        assert_eq!(store.profiles[0].name, "Levi");
+        assert_eq!(store.active.as_deref(), Some("levi"));
+        // O perfil criado tem que herdar a sessao que ja esta aberta, senao ela
+        // fica orfa na pasta legada e o usuario cai num QR code.
+        assert_eq!(store.pending_adopt.as_deref(), Some("levi"));
+        assert!(store.onboarding_done);
+    }
+
+    #[test]
+    fn primeiro_perfil_recusa_quando_ja_existe_algum() {
+        let mut store = Store {
+            profiles: vec![profile("Ana", "ana")],
+            ..Store::default()
+        };
+        assert!(create_first_in(&mut store, "Levi").is_err());
+        assert_eq!(store.profiles.len(), 1);
+    }
+
+    #[test]
+    fn profiles_json_de_versao_anterior_continua_carregando() {
+        // Arquivo escrito pela 1.1.0, sem o campo de boas-vindas.
+        let raw = r#"{"profiles":[{"name":"Ana","slug":"ana"}],"active":"ana"}"#;
+        let store: Store = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(store.active.as_deref(), Some("ana"));
+        // O campo ausente vira `false` em vez de quebrar o parse. Quem ja tem
+        // perfil nao ve a tela mesmo assim: o gate no boot tambem exige que a
+        // lista de perfis esteja vazia.
+        assert!(!store.onboarding_done);
     }
 }

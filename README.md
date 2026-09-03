@@ -20,6 +20,8 @@ Arquitetura resumida:
 - Multiplos perfis: cada perfil tem a propria sessao do WhatsApp, como se fosse
   outro navegador. Um ativo por vez; criar e alternar pelo menu do tray. Sem
   perfil criado, nada muda para quem usa sozinho.
+- Tela de boas-vindas na primeira execucao: pergunta se o computador e
+  compartilhado e, em caso positivo, cria o primeiro perfil ali mesmo.
 - Tray icon com menu (abrir/focar, perfis, autostart e sair).
 - Autostart com Windows (inicializacao com --hidden).
 - Notificacoes nativas de nova mensagem (com foco/abertura da janela ao clicar no popup no Windows).

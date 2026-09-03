@@ -4,7 +4,8 @@
   "description": "Capability for the app windows",
   "windows": [
     "main",
-    "profiles"
+    "profiles",
+    "onboarding"
   ],
   "permissions": [
     "core:default",

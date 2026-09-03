@@ -1795,29 +1795,65 @@ fn create_main_window(
     Ok(main_window)
 }
 
-/// Abre o diálogo de "Adicionar perfil", ou foca o que já estiver aberto.
-fn open_profiles_window(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("profiles") {
+/// Abre uma janela auxiliar (boas-vindas, adicionar perfil) ou foca a que já
+/// estiver aberta.
+///
+/// O `additional_browser_args` **tem** que ser o mesmo da janela principal: o
+/// WebView2 recusa criar um segundo ambiente sobre a mesma pasta de dados com
+/// opções diferentes, e a falha se manifesta como uma janela que aparece e some
+/// num piscar de olhos. Ver a nota do wry em `web_context.rs`: "Webview
+/// instances with different CoreWebView2EnvironmentOptions must have different
+/// data_directory's".
+fn open_helper_window(app: &tauri::AppHandle, label: &str, page: &str, title: &str, height: f64) {
+    if let Some(win) = app.get_webview_window(label) {
         let _ = win.show();
         let _ = win.set_focus();
         return;
     }
 
-    let mut builder =
-        WebviewWindowBuilder::new(app, "profiles", WebviewUrl::App("profiles.html".into()))
-            .title("Adicionar perfil — WhatsApp Lite")
-            .inner_size(420.0, 440.0)
-            .resizable(false)
-            .center();
+    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
+        .title(title)
+        .inner_size(420.0, height)
+        .resizable(false)
+        .center()
+        .additional_browser_args(WEBVIEW2_BROWSER_ARGS);
 
-    // Mesma pasta da janela principal de propósito: dois ambientes WebView2 com
-    // pastas diferentes no mesmo processo é território de bug, e este diálogo
-    // não guarda estado nenhum.
+    // Mesma pasta da janela principal de propósito: estas janelas não guardam
+    // estado nenhum e não têm por que ter sessão própria.
     if let Some(dir) = profiles::managed_data_dir(app) {
         builder = builder.data_directory(dir);
     }
 
-    let _ = builder.build();
+    // Nada de `let _`: foi engolir este erro que transformou uma falha clara num
+    // pisca inexplicável.
+    if let Err(err) = builder.build() {
+        app.dialog()
+            .message(format!("Não foi possível abrir a janela: {err}"))
+            .title("WhatsApp Lite")
+            .show(|_| {});
+    }
+}
+
+/// Abre o diálogo de "Adicionar perfil", ou foca o que já estiver aberto.
+fn open_profiles_window(app: &tauri::AppHandle) {
+    open_helper_window(
+        app,
+        "profiles",
+        "profiles.html",
+        "Adicionar perfil — WhatsApp Lite",
+        440.0,
+    );
+}
+
+/// Abre a tela de boas-vindas da primeira execução.
+fn open_onboarding_window(app: &tauri::AppHandle) {
+    open_helper_window(
+        app,
+        "onboarding",
+        "onboarding.html",
+        "Bem-vindo ao WhatsApp Lite",
+        460.0,
+    );
 }
 
 /// Reinicia o app no perfil que estiver gravado como ativo.
@@ -1895,6 +1931,27 @@ fn profiles_add(
 #[tauri::command]
 fn profiles_cancel(app: tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("profiles") {
+        let _ = win.close();
+    }
+}
+
+/// "Só eu uso este computador": registra a resposta e não cria perfil nenhum.
+#[tauri::command]
+fn onboarding_dismiss(app: tauri::AppHandle) -> Result<(), String> {
+    profiles::mark_onboarding_done(&app)
+}
+
+/// "Compartilho com outra pessoa": cria o primeiro perfil, que herda a sessão
+/// atual, e reinicia dentro dele.
+#[tauri::command]
+fn onboarding_create(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    profiles::create_first(&app, name)?;
+    relaunch(&app)
+}
+
+#[tauri::command]
+fn onboarding_close(app: tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("onboarding") {
         let _ = win.close();
     }
 }
@@ -2297,6 +2354,16 @@ pub fn run() {
                 main_window.open_devtools();
             }
 
+            // Boas-vindas: só na primeira execução de quem ainda não respondeu e
+            // não tem perfil nenhum. Nunca num boot de autostart (`--hidden`) —
+            // ninguém quer tela de configuração aparecendo sozinha no login.
+            if !start_hidden
+                && !profiles_snapshot.onboarding_done
+                && profiles_snapshot.profiles.is_empty()
+            {
+                open_onboarding_window(app.handle());
+            }
+
             start_webview_maintenance(app_handle);
 
             Ok(())
@@ -2313,7 +2380,10 @@ pub fn run() {
             is_do_not_disturb,
             profiles_info,
             profiles_add,
-            profiles_cancel
+            profiles_cancel,
+            onboarding_dismiss,
+            onboarding_create,
+            onboarding_close
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

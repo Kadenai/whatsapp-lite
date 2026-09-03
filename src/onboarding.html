@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bem-vindo ao WhatsApp Lite</title>
+  <link rel="stylesheet" href="profiles.css" />
+</head>
+<body>
+  <main>
+    <!-- Passo 1: a pergunta. -->
+    <section id="step_ask">
+      <h1>Quem usa este computador?</h1>
+      <p class="lead">
+        Se mais de uma pessoa usa esta máquina, o WhatsApp Lite pode guardar uma
+        conta para cada uma — como se fossem navegadores diferentes, sem precisar
+        deslogar e escanear o QR code toda vez.
+      </p>
+      <div class="actions column">
+        <button type="button" id="shared">Compartilho com outra pessoa</button>
+        <button type="button" id="alone" class="ghost">Só eu uso este computador</button>
+      </div>
+    </section>
+
+    <!-- Passo 2a: criar o primeiro perfil. -->
+    <section id="step_name" hidden>
+      <h1>Como chamar a sua conta?</h1>
+      <p class="lead">
+        Sua sessão atual continua exatamente como está, só passa a ter um nome. A
+        conta da outra pessoa você cria depois, pelo menu da bandeja.
+      </p>
+      <form id="form" autocomplete="off">
+        <label>
+          <span>Seu nome</span>
+          <input id="name" type="text" maxlength="24" placeholder="Ex.: Levi" />
+          <small>Aparece no título da janela e no menu da bandeja.</small>
+        </label>
+
+        <p id="status" hidden></p>
+
+        <div class="actions">
+          <button type="button" id="back" class="ghost">Voltar</button>
+          <button type="submit" id="submit">Criar e continuar</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Passo 2b: recusou, mas fica sabendo onde encontrar depois. -->
+    <section id="step_alone" hidden>
+      <h1>Tudo certo</h1>
+      <p class="lead">
+        Nada muda no seu WhatsApp Lite. Se um dia outra pessoa passar a usar este
+        computador, clique com o botão direito no ícone do app na bandeja (perto
+        do relógio) e escolha <strong>"Adicionar perfil…"</strong>.
+      </p>
+      <div class="actions">
+        <button type="button" id="done">Entendi</button>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="onboarding.js"></script>
+</body>
+</html>
