@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Adicionar perfil</title>
+  <link rel="stylesheet" href="profiles.css" />
+</head>
+<body>
+  <main>
+    <h1>Adicionar perfil</h1>
+    <p class="lead">
+      Cada perfil tem a própria sessão do WhatsApp, como se fosse outro
+      navegador. Só um fica ativo por vez.
+    </p>
+
+    <form id="form" autocomplete="off">
+      <label id="current_field" hidden>
+        <span>Nome da sessão que já está aberta</span>
+        <input id="current_name" type="text" maxlength="24" placeholder="Ex.: Levi" />
+        <small>Esta conversa já logada continua intacta, só ganha um nome.</small>
+      </label>
+
+      <label>
+        <span>Nome do novo perfil</span>
+        <input id="new_name" type="text" maxlength="24" placeholder="Ex.: Ana" />
+        <small>Vai abrir na tela de QR code pra vincular o outro celular.</small>
+      </label>
+
+      <p id="status" hidden></p>
+
+      <div class="actions">
+        <button type="button" id="cancel" class="ghost">Cancelar</button>
+        <button type="submit" id="submit">Criar e abrir</button>
+      </div>
+    </form>
+  </main>
+
+  <script type="module" src="profiles.js"></script>
+</body>
+</html>

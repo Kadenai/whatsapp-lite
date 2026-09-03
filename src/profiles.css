@@ -1,0 +1,115 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: #111b21;
+  color: #e9edef;
+  font-size: 14px;
+}
+
+main {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+h1 {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.lead {
+  color: #8696a0;
+  line-height: 1.5;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+label > span {
+  font-size: 13px;
+  color: #d1d7db;
+}
+
+label > small {
+  font-size: 12px;
+  color: #8696a0;
+}
+
+input {
+  background: #2a3942;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: #e9edef;
+  font-size: 14px;
+  font-family: inherit;
+}
+
+input:focus {
+  outline: none;
+  border-color: #00a884;
+}
+
+#status {
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #3b2b2b;
+  color: #f8a9a9;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+button {
+  border: none;
+  border-radius: 6px;
+  padding: 10px 18px;
+  font-size: 14px;
+  font-family: inherit;
+  font-weight: 500;
+  color: #111b21;
+  background: #00a884;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #06cf9c;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.ghost {
+  background: transparent;
+  color: #8696a0;
+}
+
+button.ghost:hover {
+  background: #202c33;
+  color: #e9edef;
+}

@@ -17,7 +17,10 @@ Arquitetura resumida:
 ## Recursos implementados
 
 - Instancia unica: se abrir de novo, foca a janela existente.
-- Tray icon com menu (abrir/focar, autostart e sair).
+- Multiplos perfis: cada perfil tem a propria sessao do WhatsApp, como se fosse
+  outro navegador. Um ativo por vez; criar e alternar pelo menu do tray. Sem
+  perfil criado, nada muda para quem usa sozinho.
+- Tray icon com menu (abrir/focar, perfis, autostart e sair).
 - Autostart com Windows (inicializacao com --hidden).
 - Notificacoes nativas de nova mensagem (com foco/abertura da janela ao clicar no popup no Windows).
 - Regra para notificar somente quando a janela nao esta ativa.
@@ -41,6 +44,7 @@ Arquitetura resumida:
 
 - [src](src): splash minimo de inicializacao.
 - [src-tauri/src/lib.rs](src-tauri/src/lib.rs): backend Rust + comandos + patch JS.
+- [src-tauri/src/profiles.rs](src-tauri/src/profiles.rs): perfis (pasta de dados por perfil).
 - [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json): configuracao do app e bundle.
 - [scripts/verify-no-right-click.js](scripts/verify-no-right-click.js): verificacao de politica do projeto.
 

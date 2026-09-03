@@ -17,6 +17,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod profiles;
+
+// Passado ao processo sucessor num relaunch: o PID que ele precisa esperar
+// morrer antes de subir.
+const RELAUNCH_ARG: &str = "--relaunch-after=";
+
 // Nunca recarrega mais cedo que isto desde o último reload — evita churn de
 // re-sync/rede mesmo se a memória disparar logo depois de recarregar.
 const RELOAD_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -1752,12 +1758,19 @@ fn create_main_window(
     focused: bool,
 ) -> tauri::Result<tauri::WebviewWindow> {
     let nav_app_handle = app.clone();
-    let main_window = WebviewWindowBuilder::new(
+    // Com perfis em uso o nome vai no título: são duas sessões diferentes e
+    // digitar na janela errada é fácil demais sem essa dica.
+    let title = match profiles::managed_active_name(app) {
+        Some(name) => format!("WhatsAppLite — {name}"),
+        None => "WhatsAppLite".to_string(),
+    };
+
+    let mut builder = WebviewWindowBuilder::new(
         app,
         "main",
         WebviewUrl::External("https://web.whatsapp.com".parse().unwrap()),
     )
-    .title("WhatsAppLite")
+    .title(&title)
     .inner_size(1100.0, 720.0)
     .min_inner_size(780.0, 480.0)
     .center()
@@ -1768,11 +1781,122 @@ fn create_main_window(
     .additional_browser_args(WEBVIEW2_BROWSER_ARGS)
     .disable_drag_drop_handler()
     .initialization_script(&whatsapp_patches_script())
-    .on_navigation(move |url| allow_whatsapp_navigation(nav_app_handle.clone(), url))
-    .build()?;
+    .on_navigation(move |url| allow_whatsapp_navigation(nav_app_handle.clone(), url));
+
+    // Sem perfis, `None`: o Tauri usa a pasta padrão dele e nada muda de lugar
+    // pra quem nunca tocou no recurso.
+    if let Some(dir) = profiles::managed_data_dir(app) {
+        builder = builder.data_directory(dir);
+    }
+
+    let main_window = builder.build()?;
 
     install_close_to_tray(&main_window);
     Ok(main_window)
+}
+
+/// Abre o diálogo de "Adicionar perfil", ou foca o que já estiver aberto.
+fn open_profiles_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("profiles") {
+        let _ = win.show();
+        let _ = win.set_focus();
+        return;
+    }
+
+    let mut builder =
+        WebviewWindowBuilder::new(app, "profiles", WebviewUrl::App("profiles.html".into()))
+            .title("Adicionar perfil — WhatsApp Lite")
+            .inner_size(420.0, 440.0)
+            .resizable(false)
+            .center();
+
+    // Mesma pasta da janela principal de propósito: dois ambientes WebView2 com
+    // pastas diferentes no mesmo processo é território de bug, e este diálogo
+    // não guarda estado nenhum.
+    if let Some(dir) = profiles::managed_data_dir(app) {
+        builder = builder.data_directory(dir);
+    }
+
+    let _ = builder.build();
+}
+
+/// Reinicia o app no perfil que estiver gravado como ativo.
+///
+/// Não dá pra usar `app.restart()`: o processo novo subiria enquanto este ainda
+/// segura o mutex do single-instance — e morreria achando que já existe uma
+/// instância aberta. Além disso a pasta da WebView continua travada até este
+/// processo morrer, e é ela que a adoção de perfil precisa mover. Por isso o
+/// sucessor recebe o PID atual e espera.
+fn relaunch(app: &tauri::AppHandle) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| format!("executável atual: {err}"))?;
+    std::process::Command::new(exe)
+        .arg(format!("{RELAUNCH_ARG}{}", std::process::id()))
+        .spawn()
+        .map_err(|err| format!("não foi possível reiniciar: {err}"))?;
+    app.exit(0);
+    Ok(())
+}
+
+/// Espera o processo anterior morrer antes de seguir com o boot. Roda antes de
+/// o Tauri subir, porque o single-instance registra o mutex durante o build.
+fn wait_for_relaunch_predecessor() {
+    let pid = std::env::args().find_map(|arg| {
+        arg.strip_prefix(RELAUNCH_ARG)
+            .and_then(|value| value.parse::<u32>().ok())
+    });
+    if let Some(pid) = pid {
+        wait_for_pid_exit(pid);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_pid_exit(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+
+    unsafe {
+        // Erro aqui quer dizer que o processo já morreu — que é justamente o que
+        // estávamos esperando.
+        let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
+            return;
+        };
+        // Teto de 10s: se o anterior travar, é melhor tentar subir mesmo assim do
+        // que deixar o usuário sem app.
+        let _ = WaitForSingleObject(handle, 10_000);
+        let _ = CloseHandle(handle);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_pid_exit(_pid: u32) {
+    std::thread::sleep(Duration::from_millis(1500));
+}
+
+/// Informa ao diálogo se ele precisa pedir também o nome da sessão atual — o que
+/// só acontece na primeira vez, quando ainda não existe perfil nenhum.
+#[tauri::command]
+fn profiles_info(app: tauri::AppHandle) -> serde_json::Value {
+    let store = profiles::load(&app);
+    serde_json::json!({ "needs_current_name": store.profiles.is_empty() })
+}
+
+#[tauri::command]
+fn profiles_add(
+    app: tauri::AppHandle,
+    current_name: Option<String>,
+    new_name: String,
+) -> Result<(), String> {
+    profiles::add(&app, current_name, new_name)?;
+    relaunch(&app)
+}
+
+#[tauri::command]
+fn profiles_cancel(app: tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("profiles") {
+        let _ = win.close();
+    }
 }
 
 // ============================================================================
@@ -2008,6 +2132,8 @@ fn start_webview_maintenance(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    wait_for_relaunch_predecessor();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::Builder::new().open_js_links_on_click(false).build())
         .plugin(tauri_plugin_dialog::init())
@@ -2028,6 +2154,20 @@ pub fn run() {
         ))
         .setup(|app| {
             app.manage(RuntimeState::new());
+
+            // Perfis. Tem que vir antes de qualquer janela: a adoção da pasta
+            // legada move o diretório da WebView, e isso só é possível enquanto
+            // ela não abriu.
+            let mut profile_store = profiles::load(app.handle());
+            let adopt_error = profiles::adopt_pending(app.handle(), &mut profile_store).err();
+            let profiles_snapshot = profile_store.clone();
+            app.manage(std::sync::Mutex::new(profile_store));
+            if let Some(err) = adopt_error {
+                app.dialog()
+                    .message(err)
+                    .title("WhatsApp Lite")
+                    .show(|_| {});
+            }
 
             // Limpeza: avatares temporários com mais de 24h ficam órfãos quando o
             // usuário conversa com gente nova e nunca mais com a antiga. Não é
@@ -2054,20 +2194,70 @@ pub fn run() {
                     .checked(is_autostart)
                     .build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Sair").build(app)?;
-            let tray_menu = MenuBuilder::new(app)
-                .item(&show_item)
+
+            // Perfis: um item marcável por perfil, mais o "Adicionar perfil…".
+            // Sem perfis criados aparece só o "Adicionar" — quem usa sozinho não
+            // precisa saber que isto existe. O menu não muda em runtime porque
+            // toda alteração de perfil reinicia o app.
+            let mut profile_items = Vec::new();
+            for profile in &profiles_snapshot.profiles {
+                let item = CheckMenuItemBuilder::with_id(
+                    format!("profile:{}", profile.slug),
+                    &profile.name,
+                )
+                .checked(Some(profile.slug.as_str()) == profiles_snapshot.active.as_deref())
+                .build(app)?;
+                profile_items.push((profile.slug.clone(), item));
+            }
+            let add_profile_item =
+                MenuItemBuilder::with_id("add_profile", "Adicionar perfil…").build(app)?;
+
+            let mut menu_builder = MenuBuilder::new(app).item(&show_item).separator();
+            for (_, item) in &profile_items {
+                menu_builder = menu_builder.item(item);
+            }
+            let tray_menu = menu_builder
+                .item(&add_profile_item)
+                .separator()
                 .item(&autostart_item)
                 .item(&quit_item)
                 .build()?;
 
             // Tray icon
             let autostart_item_for_menu = autostart_item.clone();
+            let active_slug = profiles_snapshot.active.clone();
+            let profile_items_for_menu = profile_items.clone();
+            let tooltip = match profiles_snapshot.active_name() {
+                Some(name) => format!("WhatsApp Lite — {name}"),
+                None => "WhatsApp Lite".to_string(),
+            };
             let _tray = TrayIconBuilder::new()
                 .icon(icon)
-                .tooltip("WhatsApp Lite")
+                .tooltip(&tooltip)
                 .menu(&tray_menu)
                 .on_menu_event(move |app, event| {
-                    if event.id() == "show" {
+                    if let Some(slug) = event.id().0.strip_prefix("profile:") {
+                        // Clicar no perfil já ativo só desmarcaria o item; remarca
+                        // e não faz mais nada.
+                        if Some(slug) == active_slug.as_deref() {
+                            if let Some((_, item)) =
+                                profile_items_for_menu.iter().find(|(s, _)| s == slug)
+                            {
+                                let _ = item.set_checked(true);
+                            }
+                            return;
+                        }
+                        let switched = profiles::set_active(app, slug)
+                            .and_then(|()| relaunch(app));
+                        if let Err(err) = switched {
+                            app.dialog().message(err).title("WhatsApp Lite").show(|_| {});
+                        }
+                        return;
+                    }
+
+                    if event.id() == "add_profile" {
+                        open_profiles_window(app);
+                    } else if event.id() == "show" {
                         focus_main_window(app.clone());
                     } else if event.id() == "quit" {
                         app.exit(0);
@@ -2120,7 +2310,10 @@ pub fn run() {
             send_notification,
             set_call_active,
             report_heap_mb,
-            is_do_not_disturb
+            is_do_not_disturb,
+            profiles_info,
+            profiles_add,
+            profiles_cancel
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
