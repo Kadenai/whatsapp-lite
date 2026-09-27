@@ -1,6 +1,8 @@
 // Perfis: cada um é uma pasta de dados própria do WebView2, o que na prática
 // equivale a dois navegadores diferentes — sessão, cookies e IndexedDB
-// separados. Só um perfil roda por vez; trocar de perfil reinicia o app.
+// separados. Cada perfil carregado é uma janela própria; trocar de perfil só
+// esconde uma e mostra a outra. No modo pré-carregado todos ficam abertos em
+// segundo plano; fora dele só o ativo existe.
 //
 // Enquanto o usuário não adicionar o segundo perfil nada disto existe no disco:
 // `profiles.json` não é criado e a sessão continua na pasta padrão do Tauri
@@ -41,6 +43,11 @@ pub struct Store {
     /// ouvir falar de perfil nunca mais.
     #[serde(default)]
     pub onboarding_done: bool,
+    /// "Iniciar com o sistema (pré-carregado)": o perfil ativo carrega sem o
+    /// modo econômico atrapalhar o boot, e os demais perfis ficam abertos em
+    /// segundo plano. Só fica `true` com o autostart ligado.
+    #[serde(default)]
+    pub preload: bool,
 }
 
 impl Store {
@@ -51,6 +58,13 @@ impl Store {
 
     pub fn active_name(&self) -> Option<&str> {
         self.active_profile().map(|p| p.name.as_str())
+    }
+
+    pub fn name_of(&self, slug: &str) -> Option<&str> {
+        self.profiles
+            .iter()
+            .find(|p| p.slug == slug)
+            .map(|p| p.name.as_str())
     }
 }
 
@@ -97,8 +111,43 @@ fn write_atomic(path: &Path, store: &Store) -> std::io::Result<()> {
 /// Pasta de dados da WebView do perfil ativo, ou `None` no modo legado (aí o
 /// Tauri usa o default dele e nada muda de lugar).
 pub fn data_dir(app: &tauri::AppHandle, store: &Store) -> Option<PathBuf> {
-    let slug = store.active.as_deref()?;
+    profile_data_dir(app, store.active.as_deref()?)
+}
+
+/// Pasta de dados da WebView de um perfil qualquer.
+pub fn profile_data_dir(app: &tauri::AppHandle, slug: &str) -> Option<PathBuf> {
     Some(base_dir(app)?.join("profiles").join(slug))
+}
+
+/// Cópia do estado gerenciado. Cai no disco se ainda não houver estado.
+pub fn snapshot(app: &tauri::AppHandle) -> Store {
+    app.try_state::<std::sync::Mutex<Store>>()
+        .and_then(|state| state.lock().ok().map(|store| store.clone()))
+        .unwrap_or_else(|| load(app))
+}
+
+/// Altera o estado a partir do disco (a fonte da verdade), grava e espelha no
+/// estado gerenciado — que é o que as janelas e a manutenção consultam.
+fn update(
+    app: &tauri::AppHandle,
+    change: impl FnOnce(&mut Store) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut store = load(app);
+    change(&mut store)?;
+    save(app, &store).map_err(|err| format!("Falha ao gravar profiles.json: {err}"))?;
+    if let Some(state) = app.try_state::<std::sync::Mutex<Store>>() {
+        if let Ok(mut managed) = state.lock() {
+            *managed = store;
+        }
+    }
+    Ok(())
+}
+
+pub fn set_preload(app: &tauri::AppHandle, preload: bool) -> Result<(), String> {
+    update(app, |store| {
+        store.preload = preload;
+        Ok(())
+    })
 }
 
 /// Lê a pasta do perfil ativo a partir do estado gerenciado. Usada na criação
@@ -107,12 +156,6 @@ pub fn managed_data_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     let state = app.try_state::<std::sync::Mutex<Store>>()?;
     let store = state.lock().ok()?;
     data_dir(app, &store)
-}
-
-pub fn managed_active_name(app: &tauri::AppHandle) -> Option<String> {
-    let state = app.try_state::<std::sync::Mutex<Store>>()?;
-    let store = state.lock().ok()?;
-    store.active_name().map(str::to_string)
 }
 
 fn slugify(name: &str, taken: &[Profile]) -> String {
@@ -253,14 +296,15 @@ pub fn mark_onboarding_done(app: &tauri::AppHandle) -> Result<(), String> {
     save(app, &store).map_err(|err| format!("Falha ao gravar profiles.json: {err}"))
 }
 
-/// Troca o perfil ativo. Quem chama reinicia o app em seguida.
+/// Troca o perfil ativo. Quem chama cuida de mostrar a janela dele.
 pub fn set_active(app: &tauri::AppHandle, slug: &str) -> Result<(), String> {
-    let mut store = load(app);
-    if !store.profiles.iter().any(|p| p.slug == slug) {
-        return Err("Perfil inexistente.".to_string());
-    }
-    store.active = Some(slug.to_string());
-    save(app, &store).map_err(|err| format!("Falha ao gravar profiles.json: {err}"))
+    update(app, |store| {
+        if !store.profiles.iter().any(|p| p.slug == slug) {
+            return Err("Perfil inexistente.".to_string());
+        }
+        store.active = Some(slug.to_string());
+        Ok(())
+    })
 }
 
 /// Move a pasta legada pra dentro do primeiro perfil. Roda no boot, antes de
@@ -384,5 +428,7 @@ mod tests {
         // perfil nao ve a tela mesmo assim: o gate no boot tambem exige que a
         // lista de perfis esteja vazia.
         assert!(!store.onboarding_done);
+        // Nem o modo pré-carregado, que veio depois.
+        assert!(!store.preload);
     }
 }

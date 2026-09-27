@@ -1,6 +1,6 @@
 use tauri::{
     image::Image,
-    menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
+    menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
@@ -53,24 +53,157 @@ const MAINTENANCE_POLL_EVERY: Duration = Duration::from_secs(10);
 // (e só então acrescentamos CalculateNativeWinOcclusion). No-op fora do Windows.
 const WEBVIEW2_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows";
 
-/// Estado compartilhado entre o JS injetado e a thread de manutenção.
-struct RuntimeState {
+// Carregamento inicial ("aquecimento") de cada página. Enquanto aquece, a
+// página não notifica nem toca som, e no modo pré-carregado também não entra no
+// modo econômico — é o boot/sync do WhatsApp Web, a parte mais pesada, e o
+// EcoQoS o arrastaria por minutos.
+//
+// Termina WARMUP_SETTLE depois de a lista de conversas (ou o QR) aparecer: a
+// lista surge do IndexedDB antes de o sync com o celular acabar, e é nesse fim
+// de sync que chega a rajada de mensagens atrasadas.
+const WARMUP_SETTLE: Duration = Duration::from_secs(60);
+// Teto: se o sinal de pronto nunca vier (tela inesperada, seletor que mudou),
+// o aquecimento acaba mesmo assim — senão o app ficaria mudo para sempre.
+const WARMUP_CAP: Duration = Duration::from_secs(5 * 60);
+// Página que não subiu (sem rede no login do Windows, página de erro do
+// WebView2) é recarregada com estes intervalos; o último se repete.
+const BOOT_RETRY_STEPS: [Duration; 3] = [
+    Duration::from_secs(45),
+    Duration::from_secs(90),
+    Duration::from_secs(120),
+];
+
+/// O que a thread de manutenção sabe de cada página, por rótulo de janela.
+struct PageState {
+    /// Início do carregamento atual (criação, reload do app ou da página).
+    loaded_at: Instant,
+    /// O documento do WhatsApp Web subiu — não é a página de erro do WebView2.
+    booted: bool,
+    /// Quando a lista de conversas (ou o QR) apareceu neste carregamento.
+    ready_at: Option<Instant>,
+    /// Recargas por falha de boot seguidas; zera quando a página sobe.
+    retries: u32,
     /// `true` enquanto o WhatsApp Web tem uma chamada de voz/vídeo em curso
     /// (reportado pelo hook de RTCPeerConnection no JS). A manutenção nunca
     /// recarrega durante uma chamada — derrubaria a ligação.
-    call_active: std::sync::atomic::AtomicBool,
+    call_active: bool,
     /// Último tamanho do heap JS reportado pela página, em MB. `performance.memory`
     /// só existe no Chromium/WebView2; sem ele fica 0 e o reload cai no teto de tempo.
-    heap_mb: std::sync::atomic::AtomicU64,
+    heap_mb: u64,
+}
+
+impl PageState {
+    fn new(now: Instant) -> Self {
+        Self {
+            loaded_at: now,
+            booted: false,
+            ready_at: None,
+            retries: 0,
+            call_active: false,
+            heap_mb: 0,
+        }
+    }
+}
+
+/// Estado compartilhado entre o JS injetado e a thread de manutenção.
+struct RuntimeState {
+    pages: std::sync::Mutex<std::collections::HashMap<String, PageState>>,
 }
 
 impl RuntimeState {
     fn new() -> Self {
         Self {
-            call_active: std::sync::atomic::AtomicBool::new(false),
-            heap_mb: std::sync::atomic::AtomicU64::new(0),
+            pages: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
+
+    fn with_page<R>(&self, label: &str, f: impl FnOnce(&mut PageState) -> R) -> R {
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        let page = pages
+            .entry(label.to_string())
+            .or_insert_with(|| PageState::new(Instant::now()));
+        f(page)
+    }
+
+    /// Começou um carregamento novo: tudo que a página anterior reportou morreu
+    /// com ela. As tentativas de boot sobrevivem — é o reload delas que chega aqui.
+    fn page_loading(&self, label: &str) {
+        self.with_page(label, |page| {
+            let retries = page.retries;
+            *page = PageState::new(Instant::now());
+            page.retries = retries;
+        });
+    }
+
+    fn warming(&self, label: &str, now: Instant) -> bool {
+        self.with_page(label, |page| page_warming(now, page.loaded_at, page.ready_at))
+    }
+
+    fn forget(&self, label: &str) {
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        pages.remove(label);
+    }
+}
+
+fn page_warming(now: Instant, loaded_at: Instant, ready_at: Option<Instant>) -> bool {
+    match ready_at {
+        Some(ready) => now.duration_since(ready) < WARMUP_SETTLE,
+        None => now.duration_since(loaded_at) < WARMUP_CAP,
+    }
+}
+
+/// Modo econômico (memória baixa + EcoQoS) só com a janela escondida. No modo
+/// pré-carregado ele espera o aquecimento acabar; no simples entra na hora,
+/// como sempre foi.
+fn eco_wanted(hidden: bool, warming: bool, preload: bool) -> bool {
+    hidden && !(preload && warming)
+}
+
+fn boot_retry_due(now: Instant, loaded_at: Instant, booted: bool, retries: u32) -> bool {
+    let step = BOOT_RETRY_STEPS[(retries as usize).min(BOOT_RETRY_STEPS.len() - 1)];
+    !booted && now.duration_since(loaded_at) >= step
+}
+
+/// Regra absoluta: perfil que não é o ativo nunca notifica nem toca som. E
+/// nenhum perfil notifica enquanto aquece.
+fn notifications_allowed(is_active: bool, warming: bool) -> bool {
+    is_active && !warming
+}
+
+// Janelas do WhatsApp: `main` no modo sem perfis, `main-<slug>` com perfis.
+const MAIN_LABEL: &str = "main";
+const MAIN_LABEL_PREFIX: &str = "main-";
+
+fn main_label(slug: Option<&str>) -> String {
+    match slug {
+        Some(slug) => format!("{MAIN_LABEL_PREFIX}{slug}"),
+        None => MAIN_LABEL.to_string(),
+    }
+}
+
+fn is_main_label(label: &str) -> bool {
+    label == MAIN_LABEL || label.starts_with(MAIN_LABEL_PREFIX)
+}
+
+fn active_main_label(app: &tauri::AppHandle) -> String {
+    main_label(profiles::snapshot(app).active.as_deref())
+}
+
+/// Janelas que devem existir: o perfil ativo sempre; no modo pré-carregado,
+/// também todos os outros. O ativo vem primeiro.
+fn expected_main_windows(store: &profiles::Store) -> Vec<(String, Option<String>)> {
+    let Some(active) = store.active.clone() else {
+        return vec![(main_label(None), None)];
+    };
+    let mut windows = vec![(main_label(Some(&active)), Some(active.clone()))];
+    if store.preload {
+        for profile in &store.profiles {
+            if profile.slug != active {
+                windows.push((main_label(Some(&profile.slug)), Some(profile.slug.clone())));
+            }
+        }
+    }
+    windows
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,36 +352,68 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_call_active(state: tauri::State<'_, RuntimeState>, active: bool) {
-    state
-        .call_active
-        .store(active, std::sync::atomic::Ordering::Relaxed);
+fn set_call_active(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, RuntimeState>,
+    active: bool,
+) {
+    state.with_page(window.label(), |page| page.call_active = active);
 }
 
 #[tauri::command]
-fn report_heap_mb(state: tauri::State<'_, RuntimeState>, mb: u64) {
-    state.heap_mb.store(mb, std::sync::atomic::Ordering::Relaxed);
+fn report_heap_mb(window: tauri::WebviewWindow, state: tauri::State<'_, RuntimeState>, mb: u64) {
+    state.with_page(window.label(), |page| page.heap_mb = mb);
 }
 
-/// Mesma checagem usada por `send_notification` pra pular o toast — exposta ao
-/// JS pra que o proprio WhatsApp Web possa silenciar o som de notificacao que
-/// ele toca por conta propria (independente da Notification API, que ja
-/// suprimimos no toast nativo).
+/// Marcos do carregamento reportados pelo JS: `booted` (o documento do WhatsApp
+/// Web subiu) e `ready` (lista de conversas ou QR na tela).
 #[tauri::command]
-fn is_do_not_disturb() -> bool {
+fn report_page_stage(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, RuntimeState>,
+    stage: String,
+) {
+    let now = Instant::now();
+    state.with_page(window.label(), |page| match stage.as_str() {
+        "booted" => {
+            page.booted = true;
+            page.retries = 0;
+        }
+        "ready" => {
+            page.booted = true;
+            page.retries = 0;
+            page.ready_at.get_or_insert(now);
+        }
+        _ => {}
+    });
+}
+
+/// Estado de som pro JS: `dnd` repete a checagem que `send_notification` usa
+/// pra pular o toast, e `silent` é a regra de perfil ativo / aquecimento. Os
+/// dois servem pra silenciar o som que o WhatsApp Web toca por conta própria,
+/// independente da Notification API.
+#[tauri::command]
+fn sound_state(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, RuntimeState>,
+) -> serde_json::Value {
     #[cfg(target_os = "windows")]
-    {
-        windows_do_not_disturb_enabled()
-    }
+    let dnd = windows_do_not_disturb_enabled();
     #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
+    let dnd = false;
+
+    let label = window.label();
+    let allowed = notifications_allowed(
+        label == active_main_label(&app),
+        state.warming(label, Instant::now()),
+    );
+    serde_json::json!({ "dnd": dnd, "silent": !allowed })
 }
 
 #[tauri::command]
 fn focus_main_window(app: tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
+    if let Some(win) = app.get_webview_window(&active_main_label(&app)) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
@@ -407,6 +572,7 @@ fn show_chat_toast(
     avatar_path: Option<&std::path::Path>,
     tag: &str,
     click_id: String,
+    window_label: String,
 ) -> Result<(), String> {
     use windows::{
         core::{IInspectable, HSTRING},
@@ -472,7 +638,20 @@ fn show_chat_toast(
     let app_handle = app.clone();
     let handler = TypedEventHandler::<ToastNotification, IInspectable>::new(
         move |_sender, _args| {
-            if let Some(win) = app_handle.get_webview_window("main") {
+            // Toast antigo que ficou na central de notificações de um perfil que
+            // deixou de ser o ativo: clicar nele leva para aquele perfil.
+            if window_label != active_main_label(&app_handle) {
+                if let Some(slug) = window_label.strip_prefix(MAIN_LABEL_PREFIX) {
+                    let handle = app_handle.clone();
+                    let slug = slug.to_string();
+                    let _ = app_handle.run_on_main_thread(move || {
+                        if let Err(err) = switch_profile(&handle, &slug) {
+                            handle.dialog().message(err).title("WhatsApp Lite").show(|_| {});
+                        }
+                    });
+                }
+            }
+            if let Some(win) = app_handle.get_webview_window(&window_label) {
                 let _ = win.show();
                 let _ = win.unminimize();
                 let _ = win.set_focus();
@@ -507,12 +686,22 @@ fn show_chat_toast(
 #[tauri::command]
 fn send_notification(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, RuntimeState>,
     title: String,
     body: String,
     image_bytes: Option<Vec<u8>>,
     notification_id: Option<String>,
     tag: Option<String>,
 ) -> Result<(), String> {
+    let label = window.label().to_string();
+    if !notifications_allowed(
+        label == active_main_label(&app),
+        state.warming(&label, Instant::now()),
+    ) {
+        return Ok(());
+    }
+
     #[cfg(target_os = "windows")]
     {
         if windows_do_not_disturb_enabled() {
@@ -586,12 +775,13 @@ fn send_notification(
             avatar_path.as_deref(),
             &tag_str,
             notif_id,
+            label,
         );
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (image_bytes, notification_id, tag);
+        let _ = (image_bytes, notification_id, tag, label);
         app.notification()
             .builder()
             .id(1)
@@ -704,6 +894,88 @@ mod tests {
             None,
             false,
         ));
+    }
+
+    #[test]
+    fn warming_ends_after_settle_or_cap() {
+        let now = Instant::now();
+        // Carregando há pouco, sem sinal de pronto: aquecendo.
+        assert!(page_warming(now, now - Duration::from_secs(30), None));
+        // Pronto há pouco: ainda esperando a rajada do fim do sync.
+        assert!(page_warming(now, now - WARMUP_CAP, Some(now - Duration::from_secs(10))));
+        // Pronto há mais que o assentamento: acabou.
+        assert!(!page_warming(now, now - Duration::from_secs(120), Some(now - WARMUP_SETTLE)));
+        // Sinal de pronto nunca veio: o teto encerra, senão o app ficaria mudo.
+        assert!(!page_warming(now, now - WARMUP_CAP, None));
+    }
+
+    #[test]
+    fn eco_waits_for_warmup_only_in_preload_mode() {
+        // Modo simples: escondida = eco na hora, como sempre foi.
+        assert!(eco_wanted(true, true, false));
+        // Pré-carregado: o boot corre sem EcoQoS...
+        assert!(!eco_wanted(true, true, true));
+        // ...e o eco entra quando o aquecimento acaba.
+        assert!(eco_wanted(true, false, true));
+        // Visível nunca é eco.
+        assert!(!eco_wanted(false, false, false));
+        assert!(!eco_wanted(false, true, true));
+    }
+
+    #[test]
+    fn boot_retry_backs_off_and_stops_when_page_is_up() {
+        let now = Instant::now();
+        let step0 = BOOT_RETRY_STEPS[0];
+        assert!(!boot_retry_due(now, now - step0 + Duration::from_secs(1), false, 0));
+        assert!(boot_retry_due(now, now - step0, false, 0));
+        // Página subiu: nunca recarrega por isto.
+        assert!(!boot_retry_due(now, now - Duration::from_secs(3600), true, 0));
+        // Segunda tentativa espera mais.
+        assert!(!boot_retry_due(now, now - step0, false, 1));
+        // Depois do último degrau, ele se repete.
+        let last = *BOOT_RETRY_STEPS.last().unwrap();
+        assert!(boot_retry_due(now, now - last, false, 50));
+    }
+
+    #[test]
+    fn only_active_profile_notifies_and_never_while_warming() {
+        assert!(notifications_allowed(true, false));
+        assert!(!notifications_allowed(true, true));
+        // Regra absoluta: perfil de fundo nunca notifica.
+        assert!(!notifications_allowed(false, false));
+        assert!(!notifications_allowed(false, true));
+    }
+
+    fn store_with(active: Option<&str>, preload: bool) -> profiles::Store {
+        let profile = |slug: &str| profiles::Profile {
+            name: slug.to_uppercase(),
+            slug: slug.to_string(),
+        };
+        profiles::Store {
+            profiles: if active.is_some() {
+                vec![profile("ana"), profile("levi")]
+            } else {
+                Vec::new()
+            },
+            active: active.map(str::to_string),
+            preload,
+            ..profiles::Store::default()
+        }
+    }
+
+    #[test]
+    fn expected_windows_follow_mode() {
+        let labels = |store: &profiles::Store| -> Vec<String> {
+            expected_main_windows(store).into_iter().map(|(l, _)| l).collect()
+        };
+        // Sem perfis: a janela de sempre, pré-carregado ou não.
+        assert_eq!(labels(&store_with(None, true)), ["main"]);
+        // Modo simples: só o ativo.
+        assert_eq!(labels(&store_with(Some("levi"), false)), ["main-levi"]);
+        // Pré-carregado: todos, com o ativo primeiro.
+        assert_eq!(labels(&store_with(Some("levi"), true)), ["main-levi", "main-ana"]);
+        assert!(is_main_label("main") && is_main_label("main-ana"));
+        assert!(!is_main_label("profiles") && !is_main_label("onboarding"));
     }
 
     #[test]
@@ -1062,6 +1334,39 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             setInterval(__waReportHeap, 30000);
         }
 
+        // === Aquecimento: avisa o Rust quando a página sobe e quando fica pronta ===
+        // `booted`: o documento é o do WhatsApp Web (#app), não a página de erro
+        // do WebView2 — sem isto o Rust recarrega, que é o retry de rede do
+        // login. `ready`: lista de conversas ou QR na tela; a partir daí o
+        // aquecimento só espera a rajada do fim do sync passar.
+        if (!window.__whatsapp_lite_stage_report_installed) {
+            window.__whatsapp_lite_stage_report_installed = true;
+
+            const __waReadySelector = [
+                '#pane-side',
+                '[data-testid="chat-list"]',
+                'div[data-ref] canvas',
+                'canvas[aria-label*="QR" i]',
+                'canvas[aria-label*="scan" i]'
+            ].join(',');
+            let __waBooted = false;
+            const __waStartedAt = Date.now();
+            const __waStageTimer = setInterval(() => {
+                if (!__waBooted && document.getElementById('app')
+                    && !document.getElementById('main-frame-error')) {
+                    __waBooted = true;
+                    tauriInvoke('report_page_stage', { stage: 'booted' }).catch(() => {});
+                }
+                if (document.querySelector(__waReadySelector)) {
+                    clearInterval(__waStageTimer);
+                    tauriInvoke('report_page_stage', { stage: 'ready' }).catch(() => {});
+                } else if (Date.now() - __waStartedAt > 10 * 60 * 1000) {
+                    // Seletor que o WhatsApp mudou: o teto do Rust cobre.
+                    clearInterval(__waStageTimer);
+                }
+            }, 500);
+        }
+
         // === Silenciar som de notificação durante Não Perturbe (Windows) ===
         // O toast nativo já é suprimido no Rust (send_notification checa o Focus
         // Assist antes de mostrar), mas o "tin-ting" de nova mensagem é um som
@@ -1094,20 +1399,34 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             window.__whatsapp_lite_dnd_mute_installed = true;
 
             let __waDndActive = false;
+            // `silent`: perfil que não é o ativo, ou página ainda aquecendo —
+            // regra do Rust. Começa mudo: o primeiro som do boot não pode
+            // escapar antes da primeira resposta chegar.
+            let __waSilent = true;
             const __waRefreshDnd = () => {
-                tauriInvoke('is_do_not_disturb', {})
-                    .then((active) => { __waDndActive = !!active; })
+                tauriInvoke('sound_state', {})
+                    .then((st) => {
+                        __waDndActive = !!(st && st.dnd);
+                        __waSilent = !!(st && st.silent);
+                    })
                     .catch(() => {});
             };
+            window.__waLiteRefreshSound = __waRefreshDnd;
             __waRefreshDnd();
             setInterval(__waRefreshDnd, 5000);
 
             // --- Caminho 1: HTMLMediaElement --------------------------------
+            // Silencioso é mais estrito que o DND: cala até o que é `loop`
+            // (o toque de chamada recebida de um perfil de fundo também é
+            // notificação). Chamada em curso, stream e mídia de conversa
+            // (blob:) continuam intocados nos dois casos.
             const __waShouldMuteMedia = (el) => {
-                if (!__waDndActive || window.__waLiteCallActive) return false;
-                if (el.srcObject || el.loop || el.muted) return false;
+                if (window.__waLiteCallActive) return false;
+                if (!__waDndActive && !__waSilent) return false;
+                if (el.srcObject || el.muted) return false;
                 const src = String(el.currentSrc || el.src || '');
-                return !src.startsWith('blob:');
+                if (src.startsWith('blob:')) return false;
+                return __waSilent || !el.loop;
             };
 
             const __waOrigPlay = HTMLMediaElement.prototype.play;
@@ -1153,7 +1472,7 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                 }
                 const orig = Ctor.prototype.start;
                 Ctor.prototype.start = function(...args) {
-                    if (__waDndActive && !window.__waLiteCallActive && !__waHasDirectGesture()) {
+                    if ((__waDndActive || __waSilent) && !window.__waLiteCallActive && !__waHasDirectGesture()) {
                         try { this.disconnect(); } catch (_) {}
                         try { this.connect = function(dest) { return dest; }; } catch (_) {}
                     }
@@ -1742,32 +2061,40 @@ fn allow_whatsapp_navigation(app: tauri::AppHandle, url: &tauri::Url) -> bool {
 
 fn install_close_to_tray(main_window: &tauri::WebviewWindow) {
     let win_handle = main_window.app_handle().clone();
+    let label = main_window.label().to_string();
     main_window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
-            if let Some(win) = win_handle.get_webview_window("main") {
+            if let Some(win) = win_handle.get_webview_window(&label) {
                 let _ = win.hide();
             }
         }
     });
 }
 
+/// Cria a janela do WhatsApp de um perfil (`None` no modo sem perfis).
 fn create_main_window(
     app: &tauri::AppHandle,
+    slug: Option<&str>,
     visible: bool,
     focused: bool,
 ) -> tauri::Result<tauri::WebviewWindow> {
+    let label = main_label(slug);
     let nav_app_handle = app.clone();
+    let nav_label = label.clone();
     // Com perfis em uso o nome vai no título: são duas sessões diferentes e
     // digitar na janela errada é fácil demais sem essa dica.
-    let title = match profiles::managed_active_name(app) {
+    let store = profiles::snapshot(app);
+    let title = match slug.and_then(|slug| store.name_of(slug)) {
         Some(name) => format!("WhatsAppLite — {name}"),
         None => "WhatsAppLite".to_string(),
     };
 
+    app.state::<RuntimeState>().page_loading(&label);
+
     let mut builder = WebviewWindowBuilder::new(
         app,
-        "main",
+        &label,
         WebviewUrl::External("https://web.whatsapp.com".parse().unwrap()),
     )
     .title(&title)
@@ -1781,11 +2108,18 @@ fn create_main_window(
     .additional_browser_args(WEBVIEW2_BROWSER_ARGS)
     .disable_drag_drop_handler()
     .initialization_script(&whatsapp_patches_script())
-    .on_navigation(move |url| allow_whatsapp_navigation(nav_app_handle.clone(), url));
+    .on_navigation(move |url| {
+        // Toda navegação de topo no WhatsApp Web (inclusive F5 e o reload que a
+        // própria página faz ao se atualizar) recomeça o aquecimento.
+        if url.host_str() == Some("web.whatsapp.com") {
+            nav_app_handle.state::<RuntimeState>().page_loading(&nav_label);
+        }
+        allow_whatsapp_navigation(nav_app_handle.clone(), url)
+    });
 
     // Sem perfis, `None`: o Tauri usa a pasta padrão dele e nada muda de lugar
     // pra quem nunca tocou no recurso.
-    if let Some(dir) = profiles::managed_data_dir(app) {
+    if let Some(dir) = slug.and_then(|slug| profiles::profile_data_dir(app, slug)) {
         builder = builder.data_directory(dir);
     }
 
@@ -1793,6 +2127,104 @@ fn create_main_window(
 
     install_close_to_tray(&main_window);
     Ok(main_window)
+}
+
+/// Itens do tray que mudam com a troca de perfil ou de modo de início.
+struct TrayItems {
+    autostart: CheckMenuItem<tauri::Wry>,
+    autostart_preload: CheckMenuItem<tauri::Wry>,
+    profiles: Vec<(String, CheckMenuItem<tauri::Wry>)>,
+}
+
+const TRAY_ID: &str = "main";
+
+/// Deixa o menu e o tooltip do tray coerentes com o estado atual.
+fn refresh_tray(app: &tauri::AppHandle) {
+    use tauri_plugin_autostart::ManagerExt;
+    let store = profiles::snapshot(app);
+    let autostart = app.autolaunch().is_enabled().unwrap_or(false);
+
+    if let Some(items) = app.try_state::<TrayItems>() {
+        let _ = items.autostart.set_checked(autostart && !store.preload);
+        let _ = items.autostart_preload.set_checked(autostart && store.preload);
+        for (slug, item) in &items.profiles {
+            let _ = item.set_checked(Some(slug.as_str()) == store.active.as_deref());
+        }
+    }
+
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let tooltip = match store.active_name() {
+            Some(name) => format!("WhatsApp Lite — {name}"),
+            None => "WhatsApp Lite".to_string(),
+        };
+        let _ = tray.set_tooltip(Some(&tooltip));
+    }
+}
+
+/// Faz o JS de cada janela reler o estado de som na hora — sem isto, a janela
+/// que acabou de sair do primeiro plano ainda poderia tocar até o próximo poll.
+fn refresh_sound_state(app: &tauri::AppHandle) {
+    for (label, win) in app.webview_windows() {
+        if is_main_label(&label) {
+            let _ = win.eval("window.__waLiteRefreshSound && window.__waLiteRefreshSound();");
+        }
+    }
+}
+
+/// Troca o perfil ativo sem reiniciar: esconde a janela atual e mostra a do
+/// destino, criando-a se ainda não existir. No modo simples a janela anterior
+/// é fechada pela manutenção logo em seguida.
+fn switch_profile(app: &tauri::AppHandle, slug: &str) -> Result<(), String> {
+    let previous = active_main_label(app);
+    profiles::set_active(app, slug)?;
+    let target = main_label(Some(slug));
+
+    match app.get_webview_window(&target) {
+        Some(win) => {
+            let _ = win.show();
+            let _ = win.unminimize();
+            let _ = win.set_focus();
+        }
+        None => {
+            create_main_window(app, Some(slug), true, true)
+                .map_err(|err| format!("Não foi possível abrir o perfil: {err}"))?;
+        }
+    }
+    if previous != target {
+        if let Some(win) = app.get_webview_window(&previous) {
+            let _ = win.hide();
+        }
+    }
+
+    refresh_tray(app);
+    refresh_sound_state(app);
+    Ok(())
+}
+
+/// Clique num item de início com o sistema. Os dois são exclusivos: marcar um
+/// desmarca o outro, e clicar no que já está marcado desliga o autostart.
+fn toggle_autostart(app: &tauri::AppHandle, preload: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let enabled = autolaunch.is_enabled().unwrap_or(false);
+    let store = profiles::snapshot(app);
+
+    let result = if enabled && store.preload == preload {
+        // Sem autostart não existe modo pré-carregado.
+        autolaunch
+            .disable()
+            .map_err(|err| err.to_string())
+            .and_then(|()| profiles::set_preload(app, false))
+    } else {
+        autolaunch
+            .enable()
+            .map_err(|err| err.to_string())
+            .and_then(|()| profiles::set_preload(app, preload))
+    };
+    if let Err(err) = result {
+        app.dialog().message(err).title("WhatsApp Lite").show(|_| {});
+    }
+    refresh_tray(app);
 }
 
 /// Abre uma janela auxiliar (boas-vindas, adicionar perfil) ou foca a que já
@@ -2116,75 +2548,145 @@ fn apply_low_power_mode(_win: &tauri::WebviewWindow, _low: bool) {}
 #[cfg(not(target_os = "windows"))]
 fn clear_webview_disk_cache(_win: &tauri::WebviewWindow) {}
 
+/// Estado da manutenção por janela.
+struct WindowMaintenance {
+    last_reload: Instant,
+    hidden_since: Option<Instant>,
+    unfocused_since: Option<Instant>,
+    /// `None` até sabermos o estado; força aplicar o modo de energia na 1ª volta.
+    low_power: Option<bool>,
+}
+
+impl WindowMaintenance {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_reload: now,
+            hidden_since: None,
+            unfocused_since: None,
+            low_power: None,
+        }
+    }
+}
+
 fn start_webview_maintenance(app: tauri::AppHandle) {
     std::thread::spawn(move || {
-        let mut last_reload = Instant::now();
-        let mut hidden_since: Option<Instant> = None;
-        let mut unfocused_since: Option<Instant> = None;
-        // `None` até sabermos o estado; força aplicar o modo de energia na 1ª volta.
-        let mut low_power: Option<bool> = None;
+        let mut windows: std::collections::HashMap<String, WindowMaintenance> =
+            std::collections::HashMap::new();
 
         loop {
             std::thread::sleep(MAINTENANCE_POLL_EVERY);
 
             let now = Instant::now();
-            let Some(win) = app.get_webview_window("main") else {
-                // Self-heal: a janela só some daqui se a WebView morreu (crash
-                // do WebView2 / kill externo) — o fechar normal apenas esconde.
-                // Recria escondida na thread principal; o usuário reabre pelo
-                // tray como sempre.
-                hidden_since = None;
-                unfocused_since = None;
-                low_power = None;
-                let handle = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    if handle.get_webview_window("main").is_none() {
-                        let _ = create_main_window(&handle, false, false);
+            let store = profiles::snapshot(&app);
+            let expected = expected_main_windows(&store);
+            let runtime = app.state::<RuntimeState>();
+
+            // Janelas que não deveriam mais existir: a do perfil anterior no
+            // modo simples, ou os perfis de fundo quando o pré-carregado foi
+            // desligado. Nunca no meio de uma chamada.
+            for (label, win) in app.webview_windows() {
+                if !is_main_label(&label) || expected.iter().any(|(l, _)| *l == label) {
+                    continue;
+                }
+                if runtime.with_page(&label, |page| page.call_active) {
+                    continue;
+                }
+                let _ = win.destroy();
+                runtime.forget(&label);
+                windows.remove(&label);
+            }
+
+            // Perfis de fundo entram um de cada vez, e só quando ninguém mais está
+            // aquecendo: o ativo aquece primeiro e nada disputa CPU e disco no login.
+            let anyone_warming = expected.iter().any(|(label, _)| {
+                app.get_webview_window(label).is_some() && runtime.warming(label, now)
+            });
+            let mut created_background = false;
+
+            for (index, (label, slug)) in expected.iter().enumerate() {
+                let is_active = index == 0;
+                let Some(win) = app.get_webview_window(label) else {
+                    windows.remove(label);
+                    // Ativo ausente = a WebView morreu (crash do WebView2 / kill
+                    // externo) — o fechar normal apenas esconde. Recria escondida;
+                    // o usuário reabre pelo tray como sempre.
+                    if is_active || (!anyone_warming && !created_background) {
+                        created_background |= !is_active;
+                        let handle = app.clone();
+                        let label = label.clone();
+                        let slug = slug.clone();
+                        let _ = app.run_on_main_thread(move || {
+                            if handle.get_webview_window(&label).is_none() {
+                                let _ = create_main_window(&handle, slug.as_deref(), false, false);
+                            }
+                        });
                     }
-                });
-                last_reload = Instant::now();
-                continue;
-            };
+                    continue;
+                };
 
-            let visible = win.is_visible().unwrap_or(true);
-            let minimized = win.is_minimized().unwrap_or(false);
-            let focused = win.is_focused().unwrap_or(true);
-            let hidden = !visible || minimized;
+                let m = windows
+                    .entry(label.clone())
+                    .or_insert_with(|| WindowMaintenance::new(now));
 
-            if hidden {
-                hidden_since.get_or_insert(now);
-            } else {
-                hidden_since = None;
-            }
-            if !focused {
-                unfocused_since.get_or_insert(now);
-            } else {
-                unfocused_since = None;
-            }
+                let visible = win.is_visible().unwrap_or(true);
+                let minimized = win.is_minimized().unwrap_or(false);
+                let focused = win.is_focused().unwrap_or(true);
+                let hidden = !visible || minimized;
 
-            // Modo de baixo consumo enquanto escondido na bandeja/minimizado:
-            // devolve memória e desprioriza os processos do WebView2 pra não
-            // brigar por CPU com outros apps. Só aplica na transição.
-            if low_power != Some(hidden) {
-                apply_low_power_mode(&win, hidden);
-                low_power = Some(hidden);
-            }
+                if hidden {
+                    m.hidden_since.get_or_insert(now);
+                } else {
+                    m.hidden_since = None;
+                }
+                if !focused {
+                    m.unfocused_since.get_or_insert(now);
+                } else {
+                    m.unfocused_since = None;
+                }
 
-            let state = app.state::<RuntimeState>();
-            let call_active = state.call_active.load(std::sync::atomic::Ordering::Relaxed);
-            let heap_mb = state.heap_mb.load(std::sync::atomic::Ordering::Relaxed);
+                let (warming, booted, loaded_at, retries, call_active, heap_mb) =
+                    runtime.with_page(label, |page| {
+                        (
+                            page_warming(now, page.loaded_at, page.ready_at),
+                            page.booted,
+                            page.loaded_at,
+                            page.retries,
+                            page.call_active,
+                            page.heap_mb,
+                        )
+                    });
 
-            if due_reload(now, last_reload, heap_mb, hidden_since, unfocused_since, call_active)
-                && win.reload().is_ok()
-            {
-                last_reload = Instant::now();
-                // Zera o heap conhecido: o valor velho (alto) não pode disparar
-                // outro reload antes da página nova reportar o seu.
-                state.heap_mb.store(0, std::sync::atomic::Ordering::Relaxed);
-                // Limpa só o cache de disco (mídia acumulada), sem tocar em
-                // cookies/IndexedDB — não desloga. Casado com o reload pra
-                // manter o perfil do WebView2 enxuto ao longo do tempo.
-                clear_webview_disk_cache(&win);
+                // Modo de baixo consumo enquanto escondido na bandeja/minimizado:
+                // devolve memória e desprioriza os processos do WebView2 pra não
+                // brigar por CPU com outros apps. Só aplica na transição.
+                let low = eco_wanted(hidden, warming, store.preload);
+                if m.low_power != Some(low) {
+                    apply_low_power_mode(&win, low);
+                    m.low_power = Some(low);
+                }
+
+                // A página nem subiu (sem rede no login, página de erro): tenta de novo.
+                if boot_retry_due(now, loaded_at, booted, retries) {
+                    if win.reload().is_ok() {
+                        runtime.with_page(label, |page| page.retries += 1);
+                        runtime.page_loading(label);
+                        m.last_reload = now;
+                    }
+                    continue;
+                }
+
+                if due_reload(now, m.last_reload, heap_mb, m.hidden_since, m.unfocused_since, call_active)
+                    && win.reload().is_ok()
+                {
+                    m.last_reload = now;
+                    // Zera o heap conhecido: o valor velho (alto) não pode disparar
+                    // outro reload antes da página nova reportar o seu.
+                    runtime.page_loading(label);
+                    // Limpa só o cache de disco (mídia acumulada), sem tocar em
+                    // cookies/IndexedDB — não desloga. Casado com o reload pra
+                    // manter o perfil do WebView2 enxuto ao longo do tempo.
+                    clear_webview_disk_cache(&win);
+                }
             }
         }
     });
@@ -2201,11 +2703,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         // Single instance: se já tiver aberto, foca a janela existente
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.unminimize();
-                let _ = win.set_focus();
-            }
+            focus_main_window(app.clone());
         }))
         // Autostart: inicia com o Windows
         .plugin(tauri_plugin_autostart::init(
@@ -2237,6 +2735,15 @@ pub fn run() {
 
             use tauri_plugin_autostart::ManagerExt;
             let autostart = app.autolaunch();
+            let is_autostart = autostart.is_enabled().unwrap_or(false);
+
+            // Autostart desligado por fora (Gerenciador de Tarefas, registro): sem
+            // ele não há modo pré-carregado, e os perfis de fundo não podem
+            // continuar abrindo sem nenhum item marcado no menu que explique.
+            let mut preload = profiles_snapshot.preload;
+            if preload && !is_autostart {
+                preload = profiles::set_preload(app.handle(), false).is_err();
+            }
 
             // Verifica se foi iniciado com --hidden (autostart)
             let args: Vec<String> = std::env::args().collect();
@@ -2247,18 +2754,26 @@ pub fn run() {
                 .expect("failed to load tray icon");
 
             // Menu de contexto do tray
-            let is_autostart = autostart.is_enabled().unwrap_or(false);
             let show_item = MenuItemBuilder::with_id("show", "Abrir").build(app)?;
+            // Dois modos de início, exclusivos entre si. O simples sobe na bandeja
+            // em modo econômico; o pré-carregado já deixa as conversas carregadas
+            // (e os outros perfis abertos em segundo plano).
             let autostart_item =
                 CheckMenuItemBuilder::with_id("autostart", "Iniciar com o sistema")
-                    .checked(is_autostart)
+                    .checked(is_autostart && !preload)
                     .build(app)?;
+            let autostart_preload_item = CheckMenuItemBuilder::with_id(
+                "autostart_preload",
+                "Iniciar com o sistema (pré-carregado)",
+            )
+            .checked(is_autostart && preload)
+            .build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Sair").build(app)?;
 
             // Perfis: um item marcável por perfil, mais o "Adicionar perfil…".
             // Sem perfis criados aparece só o "Adicionar" — quem usa sozinho não
-            // precisa saber que isto existe. O menu não muda em runtime porque
-            // toda alteração de perfil reinicia o app.
+            // precisa saber que isto existe. A lista não muda em runtime porque
+            // adicionar perfil reinicia o app; trocar só mexe nas marcações.
             let mut profile_items = Vec::new();
             for profile in &profiles_snapshot.profiles {
                 let item = CheckMenuItemBuilder::with_id(
@@ -2280,36 +2795,30 @@ pub fn run() {
                 .item(&add_profile_item)
                 .separator()
                 .item(&autostart_item)
+                .item(&autostart_preload_item)
                 .item(&quit_item)
                 .build()?;
 
+            app.manage(TrayItems {
+                autostart: autostart_item,
+                autostart_preload: autostart_preload_item,
+                profiles: profile_items,
+            });
+
             // Tray icon
-            let autostart_item_for_menu = autostart_item.clone();
-            let active_slug = profiles_snapshot.active.clone();
-            let profile_items_for_menu = profile_items.clone();
             let tooltip = match profiles_snapshot.active_name() {
                 Some(name) => format!("WhatsApp Lite — {name}"),
                 None => "WhatsApp Lite".to_string(),
             };
-            let _tray = TrayIconBuilder::new()
+            let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(icon)
                 .tooltip(&tooltip)
                 .menu(&tray_menu)
                 .on_menu_event(move |app, event| {
                     if let Some(slug) = event.id().0.strip_prefix("profile:") {
-                        // Clicar no perfil já ativo só desmarcaria o item; remarca
-                        // e não faz mais nada.
-                        if Some(slug) == active_slug.as_deref() {
-                            if let Some((_, item)) =
-                                profile_items_for_menu.iter().find(|(s, _)| s == slug)
-                            {
-                                let _ = item.set_checked(true);
-                            }
-                            return;
-                        }
-                        let switched = profiles::set_active(app, slug)
-                            .and_then(|()| relaunch(app));
-                        if let Err(err) = switched {
+                        // Clicar no perfil já ativo só desmarcaria o item; o
+                        // refresh remarca e a janela dele vem pra frente.
+                        if let Err(err) = switch_profile(app, slug) {
                             app.dialog().message(err).title("WhatsApp Lite").show(|_| {});
                         }
                         return;
@@ -2322,16 +2831,9 @@ pub fn run() {
                     } else if event.id() == "quit" {
                         app.exit(0);
                     } else if event.id() == "autostart" {
-                        use tauri_plugin_autostart::ManagerExt;
-                        let autostart = app.autolaunch();
-                        let is_enabled = autostart.is_enabled().unwrap_or(false);
-                        if is_enabled {
-                            let _ = autostart.disable();
-                        } else {
-                            let _ = autostart.enable();
-                        }
-                        let _ = autostart_item_for_menu
-                            .set_checked(autostart.is_enabled().unwrap_or(false));
+                        toggle_autostart(app, false);
+                    } else if event.id() == "autostart_preload" {
+                        toggle_autostart(app, true);
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -2348,7 +2850,12 @@ pub fn run() {
 
             // Cria a janela principal com guard de navegacao e patch JS em document_start.
             let app_handle = app.handle().clone();
-            let main_window = create_main_window(&app_handle, !start_hidden, !start_hidden)?;
+            let main_window = create_main_window(
+                &app_handle,
+                profiles_snapshot.active.as_deref(),
+                !start_hidden,
+                !start_hidden,
+            )?;
 
             // Devtools opcional: setar WA_LITE_DEVTOOLS=1 no ambiente abre
             // automaticamente. Sem isso, F12 também funciona (a feature
@@ -2380,7 +2887,8 @@ pub fn run() {
             send_notification,
             set_call_active,
             report_heap_mb,
-            is_do_not_disturb,
+            report_page_stage,
+            sound_state,
             profiles_info,
             profiles_add,
             profiles_cancel,
