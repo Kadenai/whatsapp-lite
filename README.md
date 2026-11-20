@@ -27,9 +27,16 @@ Arquitetura resumida:
 - Notificacoes nativas de nova mensagem (com foco/abertura da janela ao clicar no popup no Windows).
 - Regra para notificar somente quando a janela nao esta ativa.
 - Ignora notificacao de chats silenciados.
-- Atalhos extras:
-	- Ctrl+W para fechar conversa (simulando Escape).
+- Atalhos do app oficial do Windows (o WhatsApp Web so os liga dentro do app
+  oficial; aqui cada um e reenviado como o atalho de navegador equivalente):
+	- Ctrl+N nova conversa, Ctrl+Shift+N novo grupo, Ctrl+P perfil, Alt+S configuracoes.
+	- Ctrl+F pesquisar; Ctrl+Tab / Ctrl+] proxima conversa; Ctrl+Shift+Tab / Ctrl+[ anterior.
+	- Ctrl+W ou Ctrl+F4 fecha a conversa.
+	- Ctrl+Shift+A arquivar, Ctrl+Shift+M silenciar, Ctrl+Shift+U marcar como nao lida.
+	- Ctrl+Shift+E emojis, Ctrl+Shift+G GIFs, Ctrl+Shift+S figurinhas, Alt+L bloquear o app.
 	- Ctrl+Seta para cima para editar ultima mensagem enviada.
+- Chamadas de voz e video do WhatsApp Web: a janela da chamada abre como janela
+  do app, e microfone/camera sao liberados so para o WhatsApp.
 - Download com dialogo nativo de salvar arquivo.
 - Abertura segura de links externos via sistema operacional.
 

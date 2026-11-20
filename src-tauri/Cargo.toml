@@ -29,6 +29,7 @@ webview2-com = "0.38"
 windows = { version = "0.61", features = [
     "Data_Xml_Dom",
     "Foundation",
+    "Foundation_Collections",
     "Win32_Foundation",
     "Win32_System_Registry",
     "Win32_System_Threading",

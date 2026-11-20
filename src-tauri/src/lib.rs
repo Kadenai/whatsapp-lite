@@ -154,9 +154,10 @@ fn page_warming(now: Instant, loaded_at: Instant, ready_at: Option<Instant>) -> 
 
 /// Modo econômico (memória baixa + EcoQoS) só com a janela escondida. No modo
 /// pré-carregado ele espera o aquecimento acabar; no simples entra na hora,
-/// como sempre foi.
-fn eco_wanted(hidden: bool, warming: bool, preload: bool) -> bool {
-    hidden && !(preload && warming)
+/// como sempre foi. Nunca durante uma chamada: a janela da chamada divide os
+/// processos do WebView2 com a principal, e o EcoQoS picotaria o áudio.
+fn eco_wanted(hidden: bool, warming: bool, preload: bool, calling: bool) -> bool {
+    hidden && !calling && !(preload && warming)
 }
 
 fn boot_retry_due(now: Instant, loaded_at: Instant, booted: bool, retries: u32) -> bool {
@@ -558,6 +559,98 @@ fn cleanup_old_avatar_temp_files() {
     }
 }
 
+// Grupo de todas as toasts de conversa; Tag+Group é a chave que o Windows usa
+// pra substituir e remover uma toast.
+const TOAST_GROUP: &str = "wa-lite";
+// Ações dos botões e do menu de contexto da toast (o atributo `arguments`).
+const TOAST_REPLY_ACTION: &str = "reply";
+const TOAST_MUTE_ACTION_PREFIX: &str = "mute:";
+// Id da caixa de texto da resposta rápida.
+const TOAST_REPLY_INPUT: &str = "reply";
+// Itens do menu de contexto da toast, como no app oficial. O número é o índice
+// em `WAWebMuteExpirations.ALL_MUTE_DURATIONS` (8 horas, 1 semana, sempre).
+const TOAST_MUTE_ITEMS: [(&str, u8); 3] = [
+    ("Silenciar conversa por 8 horas", 0),
+    ("Silenciar conversa por 1 semana", 1),
+    ("Silenciar notificações", 2),
+];
+
+/// Tag da toast: o Windows aceita até 64 caracteres, sem espaço nem controle.
+fn toast_tag(tag: &str) -> String {
+    tag.chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .take(64)
+        .collect()
+}
+
+/// A tag que o WhatsApp Web põe na notificação é o JID da conversa
+/// ("<numero>@c.us", "<id>@g.us"); só com ela dá pra responder ou silenciar.
+fn is_chat_tag(tag: &str) -> bool {
+    tag.contains('@')
+}
+
+/// O que o clique na toast pede: abrir a conversa, responder com o texto
+/// digitado ou silenciar a conversa (índice da duração).
+#[derive(Debug, PartialEq, Eq)]
+enum ToastAction {
+    Open,
+    Reply(String),
+    Mute(u8),
+}
+
+fn toast_action(arguments: &str, reply_text: Option<String>) -> ToastAction {
+    if arguments == TOAST_REPLY_ACTION {
+        return match reply_text {
+            Some(text) if !text.trim().is_empty() => ToastAction::Reply(text),
+            _ => ToastAction::Open,
+        };
+    }
+    match arguments
+        .strip_prefix(TOAST_MUTE_ACTION_PREFIX)
+        .and_then(|index| index.parse::<u8>().ok())
+    {
+        Some(index) if TOAST_MUTE_ITEMS.iter().any(|(_, i)| *i == index) => ToastAction::Mute(index),
+        _ => ToastAction::Open,
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Botões e menu de contexto da toast. Resposta rápida só quando a página diz
+/// que dá pra escrever na conversa; silenciar, em qualquer conversa.
+fn toast_actions_xml(chat: bool, replyable: bool) -> String {
+    if !chat {
+        return String::new();
+    }
+    let mut xml = String::from("<actions>");
+    if replyable {
+        xml.push_str(&format!(
+            r#"<input id="{TOAST_REPLY_INPUT}" type="text" placeHolderContent="Digite uma resposta" /><action content="Enviar" arguments="{TOAST_REPLY_ACTION}" hint-inputId="{TOAST_REPLY_INPUT}" activationType="foreground" />"#
+        ));
+    }
+    for (label, index) in TOAST_MUTE_ITEMS {
+        xml.push_str(&format!(
+            r#"<action content="{}" arguments="{TOAST_MUTE_ACTION_PREFIX}{index}" placement="contextMenu" activationType="foreground" />"#,
+            xml_escape(label)
+        ));
+    }
+    xml.push_str("</actions>");
+    xml
+}
+
 /// Monta o XML do toast manualmente, cria uma `ToastNotification`, seta `Tag` e
 /// `Group` (que o wrapper `tauri-winrt-notification` 0.7.2 só expõe pra toasts
 /// de progresso) e registra o handler de Activated com bridge pra JS. Tag+Group
@@ -571,30 +664,16 @@ fn show_chat_toast(
     body: &str,
     avatar_path: Option<&std::path::Path>,
     tag: &str,
+    replyable: bool,
     click_id: String,
     window_label: String,
 ) -> Result<(), String> {
     use windows::{
-        core::{IInspectable, HSTRING},
+        core::{IInspectable, Interface, HSTRING},
         Data::Xml::Dom::XmlDocument,
-        Foundation::TypedEventHandler,
-        UI::Notifications::{ToastNotification, ToastNotificationManager},
+        Foundation::{IPropertyValue, TypedEventHandler},
+        UI::Notifications::{ToastActivatedEventArgs, ToastNotification, ToastNotificationManager},
     };
-
-    fn xml_escape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for c in s.chars() {
-            match c {
-                '&' => out.push_str("&amp;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                '"' => out.push_str("&quot;"),
-                '\'' => out.push_str("&apos;"),
-                _ => out.push(c),
-            }
-        }
-        out
-    }
 
     let image_xml = match avatar_path {
         Some(p) => format!(
@@ -605,10 +684,11 @@ fn show_chat_toast(
     };
 
     let xml = format!(
-        r#"<toast duration="short"><visual><binding template="ToastGeneric">{image}<text>{title}</text><text>{body}</text></binding></visual></toast>"#,
+        r#"<toast duration="short"><visual><binding template="ToastGeneric">{image}<text>{title}</text><text>{body}</text></binding></visual>{actions}</toast>"#,
         image = image_xml,
         title = xml_escape(title),
         body = xml_escape(body),
+        actions = toast_actions_xml(is_chat_tag(tag), replyable),
     );
 
     let xml_doc = XmlDocument::new().map_err(|e| format!("XmlDocument::new: {e}"))?;
@@ -619,25 +699,57 @@ fn show_chat_toast(
     let toast = ToastNotification::CreateToastNotification(&xml_doc)
         .map_err(|e| format!("CreateToastNotification: {e}"))?;
 
-    if !tag.is_empty() {
-        let tag_sanitized: String = tag
-            .chars()
-            .filter(|c| !c.is_control() && !c.is_whitespace())
-            .take(64)
-            .collect();
-        if !tag_sanitized.is_empty() {
-            toast
-                .SetTag(&HSTRING::from(tag_sanitized.as_str()))
-                .map_err(|e| format!("SetTag: {e}"))?;
-            toast
-                .SetGroup(&HSTRING::from("wa-lite"))
-                .map_err(|e| format!("SetGroup: {e}"))?;
-        }
+    let tag_sanitized = toast_tag(tag);
+    if !tag_sanitized.is_empty() {
+        toast
+            .SetTag(&HSTRING::from(tag_sanitized.as_str()))
+            .map_err(|e| format!("SetTag: {e}"))?;
+        toast
+            .SetGroup(&HSTRING::from(TOAST_GROUP))
+            .map_err(|e| format!("SetGroup: {e}"))?;
     }
 
     let app_handle = app.clone();
+    let chat_tag = tag.to_string();
     let handler = TypedEventHandler::<ToastNotification, IInspectable>::new(
-        move |_sender, _args| {
+        move |_sender, args| {
+            let activated = args
+                .as_ref()
+                .and_then(|args| args.cast::<ToastActivatedEventArgs>().ok());
+            let arguments = activated
+                .as_ref()
+                .and_then(|a| a.Arguments().ok())
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let reply_text = activated
+                .as_ref()
+                .and_then(|a| a.UserInput().ok())
+                .and_then(|input| input.Lookup(&HSTRING::from(TOAST_REPLY_INPUT)).ok())
+                .and_then(|value| value.cast::<IPropertyValue>().ok())
+                .and_then(|value| value.GetString().ok())
+                .map(|text| text.to_string());
+
+            // Responder e silenciar acontecem sem abrir a janela, na página do
+            // perfil que gerou a toast (mesmo que ele não seja o ativo).
+            let background_js = match toast_action(&arguments, reply_text) {
+                ToastAction::Reply(text) => Some(format!(
+                    "window.__waLiteOnNotifReply && window.__waLiteOnNotifReply({}, {});",
+                    serde_json::to_string(&chat_tag).unwrap_or_default(),
+                    serde_json::to_string(&text).unwrap_or_default(),
+                )),
+                ToastAction::Mute(index) => Some(format!(
+                    "window.__waLiteOnNotifMute && window.__waLiteOnNotifMute({}, {index});",
+                    serde_json::to_string(&chat_tag).unwrap_or_default(),
+                )),
+                ToastAction::Open => None,
+            };
+            if let Some(js) = background_js {
+                if let Some(win) = app_handle.get_webview_window(&window_label) {
+                    let _ = win.eval(&js);
+                }
+                return Ok(());
+            }
+
             // Toast antigo que ficou na central de notificações de um perfil que
             // deixou de ser o ativo: clicar nele leva para aquele perfil.
             if window_label != active_main_label(&app_handle) {
@@ -655,13 +767,11 @@ fn show_chat_toast(
                 let _ = win.show();
                 let _ = win.unminimize();
                 let _ = win.set_focus();
-                if !click_id.is_empty() {
-                    let escaped = click_id
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"");
+                if !click_id.is_empty() || is_chat_tag(&chat_tag) {
                     let js = format!(
-                        "window.__waLiteOnNotifClick && window.__waLiteOnNotifClick(\"{}\");",
-                        escaped
+                        "window.__waLiteOnNotifClick && window.__waLiteOnNotifClick({}, {});",
+                        serde_json::to_string(&click_id).unwrap_or_default(),
+                        serde_json::to_string(&chat_tag).unwrap_or_default(),
                     );
                     let _ = win.eval(&js);
                 }
@@ -683,6 +793,30 @@ fn show_chat_toast(
     Ok(())
 }
 
+/// O WhatsApp Web fechou a notificação (a conversa foi lida): tira a toast da
+/// central de notificações, como o app oficial faz.
+#[tauri::command]
+fn close_notification(app: tauri::AppHandle, tag: String) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::{core::HSTRING, UI::Notifications::ToastNotificationManager};
+
+        let tag = toast_tag(&tag);
+        if tag.is_empty() {
+            return;
+        }
+        if let Ok(history) = ToastNotificationManager::History() {
+            let _ = history.RemoveGroupedTagWithId(
+                &HSTRING::from(tag.as_str()),
+                &HSTRING::from(TOAST_GROUP),
+                &HSTRING::from(app.config().identifier.as_str()),
+            );
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (app, tag);
+}
+
 #[tauri::command]
 fn send_notification(
     app: tauri::AppHandle,
@@ -693,6 +827,7 @@ fn send_notification(
     image_bytes: Option<Vec<u8>>,
     notification_id: Option<String>,
     tag: Option<String>,
+    replyable: Option<bool>,
 ) -> Result<(), String> {
     let label = window.label().to_string();
     if !notifications_allowed(
@@ -774,6 +909,7 @@ fn send_notification(
             &clean_body,
             avatar_path.as_deref(),
             &tag_str,
+            replyable.unwrap_or(false),
             notif_id,
             label,
         );
@@ -781,7 +917,7 @@ fn send_notification(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (image_bytes, notification_id, tag, label);
+        let _ = (image_bytes, notification_id, tag, replyable, label);
         app.notification()
             .builder()
             .id(1)
@@ -912,14 +1048,82 @@ mod tests {
     #[test]
     fn eco_waits_for_warmup_only_in_preload_mode() {
         // Modo simples: escondida = eco na hora, como sempre foi.
-        assert!(eco_wanted(true, true, false));
+        assert!(eco_wanted(true, true, false, false));
         // Pré-carregado: o boot corre sem EcoQoS...
-        assert!(!eco_wanted(true, true, true));
+        assert!(!eco_wanted(true, true, true, false));
         // ...e o eco entra quando o aquecimento acaba.
-        assert!(eco_wanted(true, false, true));
+        assert!(eco_wanted(true, false, true, false));
         // Visível nunca é eco.
-        assert!(!eco_wanted(false, false, false));
-        assert!(!eco_wanted(false, true, true));
+        assert!(!eco_wanted(false, false, false, false));
+        assert!(!eco_wanted(false, true, true, false));
+    }
+
+    #[test]
+    fn eco_never_runs_during_call() {
+        assert!(!eco_wanted(true, false, false, true));
+        assert!(!eco_wanted(true, false, true, true));
+    }
+
+    #[test]
+    fn call_popout_matches_only_whatsapp_call_window() {
+        let url = |s: &str| s.parse::<tauri::Url>().unwrap();
+        assert!(is_call_popout(&url("https://web.whatsapp.com/call/popout")));
+        assert!(is_call_popout(&url("https://web.whatsapp.com/call/popout?incoming_ring=1")));
+        assert!(!is_call_popout(&url("http://web.whatsapp.com/call/popout")));
+        assert!(!is_call_popout(&url("https://web.whatsapp.com/")));
+        assert!(!is_call_popout(&url("https://evil.com/call/popout")));
+        assert!(!is_call_popout(&url("https://web.whatsapp.com.evil.com/call/popout")));
+
+        assert!(is_incoming_ring(&url("https://web.whatsapp.com/call/popout?incoming_ring=1")));
+        assert!(!is_incoming_ring(&url("https://web.whatsapp.com/call/popout")));
+        assert!(!is_incoming_ring(&url("https://web.whatsapp.com/call/popout?incoming_ring=0")));
+    }
+
+    #[test]
+    fn toast_action_reads_reply_and_mute() {
+        assert_eq!(
+            toast_action("reply", Some("oi".into())),
+            ToastAction::Reply("oi".into())
+        );
+        // Botão "Enviar" com a caixa vazia só abre a conversa.
+        assert_eq!(toast_action("reply", Some("   ".into())), ToastAction::Open);
+        assert_eq!(toast_action("reply", None), ToastAction::Open);
+        assert_eq!(toast_action("mute:0", None), ToastAction::Mute(0));
+        assert_eq!(toast_action("mute:2", None), ToastAction::Mute(2));
+        assert_eq!(toast_action("mute:9", None), ToastAction::Open);
+        assert_eq!(toast_action("mute:x", None), ToastAction::Open);
+        assert_eq!(toast_action("", None), ToastAction::Open);
+    }
+
+    #[test]
+    fn toast_actions_only_for_chats() {
+        assert_eq!(toast_actions_xml(false, true), "");
+        let muted_only = toast_actions_xml(true, false);
+        assert!(muted_only.contains(r#"placement="contextMenu""#));
+        assert!(!muted_only.contains("<input"));
+        let full = toast_actions_xml(true, true);
+        assert!(full.contains(r#"<input id="reply""#));
+        assert!(full.contains(r#"hint-inputId="reply""#));
+        // O XML de ações tem que ser válido pro LoadXml do Windows.
+        assert_eq!(full.matches("<action ").count(), 1 + TOAST_MUTE_ITEMS.len());
+    }
+
+    #[test]
+    fn toast_tag_fits_windows_limits() {
+        assert_eq!(toast_tag("5571999999999@c.us"), "5571999999999@c.us");
+        assert_eq!(toast_tag("a b\tc"), "abc");
+        assert_eq!(toast_tag(&"x".repeat(100)).len(), 64);
+        assert!(is_chat_tag("123@g.us"));
+        assert!(!is_chat_tag(""));
+    }
+
+    #[test]
+    fn media_permissions_only_for_whatsapp() {
+        assert!(is_whatsapp_origin("https://web.whatsapp.com/"));
+        assert!(is_whatsapp_origin("https://web.whatsapp.com/call/popout?incoming_ring=1"));
+        assert!(!is_whatsapp_origin("http://web.whatsapp.com/"));
+        assert!(!is_whatsapp_origin("https://whatsapp.com.evil.com/"));
+        assert!(!is_whatsapp_origin("https://evil.com/?https://web.whatsapp.com"));
     }
 
     #[test]
@@ -1084,7 +1288,8 @@ mod tests {
 ///    dispara o `onclick` original (abre a conversa certa, não só foca janela).
 ///    Toda a lógica de quando notificar (mute, foco da janela, preview ligado,
 ///    canais, status) fica com o próprio WhatsApp Web.
-/// 2. Atalhos: Ctrl+W (Escape) e Ctrl+Seta-pra-cima (editar última mensagem).
+/// 2. Atalhos do app oficial (Ctrl+N, Ctrl+F, Ctrl+Tab, Ctrl+W...) e
+///    Ctrl+Seta-pra-cima (editar última mensagem).
 /// 3. Diálogo nativo para salvar downloads.
 /// 4. Abertura segura de links externos no navegador do sistema.
 /// 5. Defesa em camadas (com o guard `on_navigation`) contra navegação
@@ -1140,6 +1345,33 @@ const WHATSAPP_PATCHES_JS: &str = r#"
         // WhatsApp Web instalou — assim o app navega para a conversa certa.
         const __waNotifs = new Map();
         let __waNotifCounter = 0;
+        // Última notificação de cada conversa: só ela pode tirar a toast da
+        // central (a toast nova do mesmo chat substitui a anterior pela tag).
+        const __waLatestByTag = new Map();
+        // O WhatsApp Web fecha toda notificação no beforeunload; num reload
+        // (inclusive o da manutenção) isso apagaria da central toasts que o
+        // usuário ainda não viu. Este listener entra antes do dele.
+        let __waUnloading = false;
+        window.addEventListener('beforeunload', () => { __waUnloading = true; }, true);
+
+        // Módulos internos do WhatsApp Web (o runtime deles expõe `require`).
+        // Qualquer falha devolve null: recurso some, o app segue.
+        const __waRequire = (name) => {
+            try {
+                return typeof window.require === 'function' ? window.require(name) : null;
+            } catch (_) {
+                return null;
+            }
+        };
+        const __waChatFor = (tag) => {
+            if (!tag || String(tag).indexOf('@') < 0) return null;
+            const mod = __waRequire('WAWebChatCollection');
+            try {
+                return (mod && mod.ChatCollection && mod.ChatCollection.get(String(tag))) || null;
+            } catch (_) {
+                return null;
+            }
+        };
 
         class WALiteNotification extends EventTarget {
             constructor(title, options) {
@@ -1190,6 +1422,11 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                     }
                 }
 
+                // Resposta rápida só onde o próprio WhatsApp deixaria escrever.
+                const chat = __waChatFor(this.tag);
+                const replyable = !!(chat && chat.canSend === true && chat.isReadOnly !== true);
+                if (this.tag) __waLatestByTag.set(this.tag, this.__waNotifId);
+
                 await tauriInvoke('send_notification', {
                     title: this.title,
                     body: this.body,
@@ -1199,7 +1436,8 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                     // (tipicamente "<numero>@c.us" ou "<id>@g.us"). É o que o
                     // Rust usa pra setar Toast.Tag/Group e fazer substituição
                     // por chat no Windows.
-                    tag: this.tag || ''
+                    tag: this.tag || '',
+                    replyable: replyable
                 });
 
                 this.__waFire('show');
@@ -1219,6 +1457,12 @@ const WHATSAPP_PATCHES_JS: &str = r#"
 
             close() {
                 __waNotifs.delete(this.__waNotifId);
+                // A conversa foi lida: tira a toast da central, como o app oficial.
+                if (!__waUnloading && this.tag
+                    && __waLatestByTag.get(this.tag) === this.__waNotifId) {
+                    __waLatestByTag.delete(this.tag);
+                    tauriInvoke('close_notification', { tag: this.tag }).catch(() => {});
+                }
                 this.__waFire('close');
             }
         }
@@ -1248,15 +1492,63 @@ const WHATSAPP_PATCHES_JS: &str = r#"
         // Chamado pelo Rust via eval quando a toast nativa é clicada.
         // Re-dispara o onclick que o WhatsApp Web instalou no objeto Notification
         // (que tipicamente faz `window.focus()` + abre a conversa correspondente).
-        window.__waLiteOnNotifClick = function(notifId) {
+        window.__waLiteOnNotifClick = function(notifId, tag) {
             const notif = __waNotifs.get(String(notifId));
-            if (!notif) return;
+            if (!notif) {
+                // Toast antiga (o objeto já foi coletado): abre a conversa pela
+                // tag, como o app oficial faz com as toasts da central.
+                const chat = __waChatFor(tag);
+                const cmd = __waRequire('WAWebCmd');
+                const entry = __waRequire('WAWebChatEntryPoint');
+                if (chat && cmd && cmd.Cmd && typeof cmd.Cmd.openChatFromUnread === 'function') {
+                    try {
+                        cmd.Cmd.openChatFromUnread({
+                            chat: chat,
+                            chatEntryPoint: entry && entry.ChatEntryPoint
+                                ? entry.ChatEntryPoint.Notification
+                                : undefined
+                        });
+                    } catch (e) {
+                        console.error('[WhatsApp Lite] Falha ao abrir conversa da toast:', e);
+                    }
+                }
+                return;
+            }
             try {
                 notif.__waFire('click', { cancelable: true });
             } catch (e) {
                 console.error('[WhatsApp Lite] Erro no click handler:', e);
             }
             __waNotifs.delete(String(notifId));
+        };
+
+        // Resposta rápida digitada na toast: envia pela mesma ação que o
+        // WhatsApp Web usa na resposta da notificação do app oficial.
+        window.__waLiteOnNotifReply = function(tag, text) {
+            const chat = __waChatFor(tag);
+            const send = __waRequire('WAWebSendTextMsgChatAction');
+            if (!chat || chat.isReadOnly === true || !send
+                || typeof send.sendTextMsgToChat !== 'function') {
+                console.error('[WhatsApp Lite] Resposta rápida indisponível para', tag);
+                return;
+            }
+            Promise.resolve(send.sendTextMsgToChat(chat, String(text)))
+                .catch((e) => console.error('[WhatsApp Lite] Falha na resposta rápida:', e));
+        };
+
+        // "Silenciar" do menu da toast: 0 = 8 horas, 1 = 1 semana, 2 = sempre.
+        window.__waLiteOnNotifMute = function(tag, index) {
+            const chat = __waChatFor(tag);
+            const exp = __waRequire('WAWebMuteExpirations');
+            const duration = exp && exp.ALL_MUTE_DURATIONS && exp.ALL_MUTE_DURATIONS[index];
+            if (!chat || !chat.mute || !duration || typeof exp.calculateMuteExpiration !== 'function') {
+                console.error('[WhatsApp Lite] Silenciar indisponível para', tag);
+                return;
+            }
+            Promise.resolve(chat.mute.mute({
+                expiration: exp.calculateMuteExpiration(duration.duration),
+                sendDevice: true
+            })).catch((e) => console.error('[WhatsApp Lite] Falha ao silenciar:', e));
         };
 
         // === Guarda de chamada ativa ===
@@ -1360,6 +1652,15 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                 if (document.querySelector(__waReadySelector)) {
                     clearInterval(__waStageTimer);
                     tauriInvoke('report_page_stage', { stage: 'ready' }).catch(() => {});
+                    // As chamadas do WhatsApp Web exigem SharedArrayBuffer, que só
+                    // existe com a página isolada (Document-Isolation-Policy). Sem
+                    // ele o site esconde as chamadas como "navegador não suportado".
+                    console.info('[WhatsApp Lite] suporte a chamadas:', {
+                        crossOriginIsolated: window.crossOriginIsolated === true,
+                        sharedArrayBuffer: typeof SharedArrayBuffer === 'function',
+                        atomics: typeof Atomics === 'object',
+                        rtcPeerConnection: typeof RTCPeerConnection === 'function'
+                    });
                 } else if (Date.now() - __waStartedAt > 10 * 60 * 1000) {
                     // Seletor que o WhatsApp mudou: o teto do Rust cobre.
                     clearInterval(__waStageTimer);
@@ -1519,31 +1820,62 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                 return best;
             };
 
+            // Atalhos do app oficial. O WhatsApp Web já traz a tabela de atalhos
+            // do app de Windows, mas só a usa rodando dentro dele; no navegador
+            // cada ação pede Ctrl+Alt+... porque o navegador reserva Ctrl+N,
+            // Ctrl+P etc. Aqui a combinação do app oficial é reenviada como a
+            // do navegador, no `document`, que é onde o WhatsApp Web escuta.
+            // Ctrl+Alt fica fora de propósito: no ABNT2 é o AltGr, e AltGr+W
+            // ("?"), AltGr+Q ("/") etc. são digitação.
+            //   [ctrl, shift, alt, tecla] -> [tecla, ctrl, shift, alt]
+            //   shift `null` = tanto faz (colchete e chave dividem a tecla).
+            const __waHybridKeys = [
+                [[true, false, false, 'n'], ['n', true, false, true]],          // nova conversa
+                [[true, true, false, 'n'], ['N', true, true, true]],            // novo grupo
+                [[true, false, false, 'p'], ['p', true, false, true]],          // perfil
+                [[false, false, true, 's'], [',', true, false, true]],          // configurações
+                [[false, false, true, 'l'], ['l', true, false, true]],          // bloquear o app
+                [[true, false, false, 'f'], ['/', true, false, true]],          // pesquisar
+                [[true, false, false, 'tab'], ['}', true, false, true]],        // próxima conversa
+                [[true, null, false, ']'], ['}', true, false, true]],
+                [[true, null, false, '}'], ['}', true, false, true]],
+                [[true, true, false, 'tab'], ['{', true, false, true]],         // conversa anterior
+                [[true, null, false, '['], ['{', true, false, true]],
+                [[true, null, false, '{'], ['{', true, false, true]],
+                [[true, false, false, 'w'], ['Escape', false, false, false]],   // fechar conversa
+                [[true, false, false, 'f4'], ['Escape', false, false, false]],
+                [[true, true, false, 'a'], ['E', true, true, true]],            // arquivar
+                [[true, true, false, 'm'], ['M', true, true, true]],            // silenciar
+                [[true, true, false, 'u'], ['U', true, true, true]],            // marcar como não lida
+                [[true, true, false, 'e'], ['e', true, false, true]],           // emojis
+                [[true, true, false, 'g'], ['g', true, false, true]],           // GIFs
+                [[true, true, false, 's'], ['s', true, false, true]],           // figurinhas
+            ];
+
+            window.addEventListener('keydown', (e) => {
+                if (!e.isTrusted || e.isComposing || e.metaKey) return;
+                const key = String(e.key || '').toLowerCase();
+                const hit = __waHybridKeys.find(([[ctrl, shift, alt, k]]) =>
+                    k === key
+                    && e.ctrlKey === ctrl
+                    && e.altKey === alt
+                    && (shift === null || e.shiftKey === shift));
+                if (!hit) return;
+
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                const [webKey, ctrlKey, shiftKey, altKey] = hit[1];
+                document.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: webKey,
+                    ctrlKey,
+                    shiftKey,
+                    altKey,
+                    bubbles: true,
+                    cancelable: true
+                }));
+            }, true);
+
             document.addEventListener('keydown', (e) => {
-                // Ctrl+W -> Escape, fecha conversa. Exige !altKey: no ABNT2
-                // brasileiro Ctrl+(left Alt) é alias de AltGr, e AltGr+W gera
-                // "?" no SO. Se não excluíssemos altKey, qualquer tentativa de
-                // digitar "?" no input do chat fecharia a conversa.
-                if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === 'KeyW') {
-                    e.preventDefault();
-                    e.stopPropagation();
-
-                    const escEvent = new KeyboardEvent('keydown', {
-                        key: 'Escape',
-                        code: 'Escape',
-                        keyCode: 27,
-                        which: 27,
-                        bubbles: true,
-                        cancelable: true
-                    });
-
-                    document.dispatchEvent(escEvent);
-                    if (document.activeElement) {
-                        document.activeElement.dispatchEvent(escEvent);
-                    }
-                    return;
-                }
-
                 // Ctrl+Seta para cima -> editar ultima mensagem enviada
                 if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'ArrowUp') {
                     e.preventDefault();
@@ -1560,28 +1892,6 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                             bubbles: true,
                             cancelable: true
                         }));
-                    }
-                    return;
-                }
-
-                // Ctrl+Shift+E -> abre o seletor de emoji (clica no botão do footer).
-                // WhatsApp Web já trata abrir/fechar via toggle, então um clique
-                // basta; um segundo Ctrl+Shift+E fecha.
-                if (e.ctrlKey && e.shiftKey && !e.altKey && (e.key === 'e' || e.key === 'E')) {
-                    e.preventDefault();
-                    e.stopPropagation();
-
-                    // Múltiplas heurísticas porque WhatsApp varia o atributo.
-                    const emojiBtn =
-                        document.querySelector('button[aria-label="Inserir emoji" i]')
-                        || document.querySelector('button[aria-label*="emoji" i]')
-                        || document.querySelector('[data-icon="smiley"]')?.closest('button, [role="button"]')
-                        || document.querySelector('[data-icon="smiley-emoji-input"]')?.closest('button, [role="button"]')
-                        || document.querySelector('button[title*="emoji" i]')
-                        || document.querySelector('footer button:has(span[data-icon*="smiley"])');
-
-                    if (emojiBtn) {
-                        emojiBtn.click();
                     }
                     return;
                 }
@@ -2048,6 +2358,164 @@ fn navigation_action(url: &tauri::Url) -> NavigationAction {
     }
 }
 
+// Interface da chamada: o WhatsApp Web abre com `window.open` uma janela em
+// /call/popout (com `?incoming_ring=1` quando o telefone toca). Sem um handler
+// de nova janela o wry recusa todo `window.open` em silêncio, e a chamada
+// nunca ganha tela.
+const CALL_POPOUT_PATH: &str = "/call/popout";
+const CALL_LABEL_PREFIX: &str = "call-";
+// Tamanho da janela de chamada quando a página não pede um (o mesmo do app oficial).
+const CALL_POPOUT_DEFAULT_SIZE: (f64, f64) = (1100.0, 800.0);
+// Janela que toca fica por cima até o usuário mexer nela; o foco que ela ganha
+// ao nascer não conta.
+const CALL_RING_FOCUS_GRACE: Duration = Duration::from_millis(1500);
+
+fn is_whatsapp_host(host: &str) -> bool {
+    host == "whatsapp.com" || host.ends_with(".whatsapp.com")
+}
+
+fn is_whatsapp_origin(url: &str) -> bool {
+    url.parse::<tauri::Url>()
+        .is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some_and(is_whatsapp_host))
+}
+
+fn is_call_popout(url: &tauri::Url) -> bool {
+    is_whatsapp_origin(url.as_str()) && url.path().eq_ignore_ascii_case(CALL_POPOUT_PATH)
+}
+
+fn is_incoming_ring(url: &tauri::Url) -> bool {
+    url.query_pairs()
+        .any(|(key, value)| key.eq_ignore_ascii_case("incoming_ring") && value == "1")
+}
+
+/// Há uma janela de chamada aberta. Ela vive pendurada na página principal, então
+/// recarregar a principal (ou pôr os processos em EcoQoS) derrubaria a ligação.
+fn call_window_open(app: &tauri::AppHandle) -> bool {
+    app.webview_windows()
+        .keys()
+        .any(|label| label.starts_with(CALL_LABEL_PREFIX))
+}
+
+/// `window.open` vindo do WhatsApp Web: a janela de chamada vira uma janela do
+/// app; links externos vão pro navegador; o resto é recusado (como sempre foi).
+fn open_new_window(
+    app: &tauri::AppHandle,
+    url: tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
+) -> tauri::webview::NewWindowResponse<tauri::Wry> {
+    use tauri::webview::NewWindowResponse;
+
+    if !is_call_popout(&url) {
+        if navigation_action(&url) == NavigationAction::OpenExternal {
+            let _ = app.opener().open_url(url.as_str(), None::<&str>);
+        }
+        return NewWindowResponse::Deny;
+    }
+
+    static NEXT_CALL_WINDOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let label = format!(
+        "{CALL_LABEL_PREFIX}{}",
+        NEXT_CALL_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let ringing = is_incoming_ring(&url);
+    let sized = features.size().is_some();
+    let placed = features.position().is_some();
+
+    let nav_app = app.clone();
+    let popup_app = app.clone();
+    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+        .window_features(features)
+        .title("Chamada — WhatsApp Lite")
+        .min_inner_size(360.0, 480.0)
+        .focused(true)
+        .disable_drag_drop_handler()
+        .on_navigation(move |url| allow_whatsapp_navigation(nav_app.clone(), url))
+        .on_new_window(move |url, _| {
+            if navigation_action(&url) == NavigationAction::OpenExternal {
+                let _ = popup_app.opener().open_url(url.as_str(), None::<&str>);
+            }
+            tauri::webview::NewWindowResponse::Deny
+        });
+    if !sized {
+        let (width, height) = CALL_POPOUT_DEFAULT_SIZE;
+        builder = builder.inner_size(width, height);
+    }
+    if ringing || !placed {
+        builder = builder.center();
+    }
+    if ringing {
+        builder = builder.always_on_top(true);
+    }
+
+    match builder.build() {
+        Ok(window) => {
+            grant_whatsapp_permissions(&window);
+            if ringing {
+                release_always_on_top_on_user_focus(&window);
+            }
+            NewWindowResponse::Create { window }
+        }
+        Err(_) => NewWindowResponse::Deny,
+    }
+}
+
+fn release_always_on_top_on_user_focus(window: &tauri::WebviewWindow) {
+    let created = Instant::now();
+    let handle = window.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::Focused(true) = event {
+            if created.elapsed() >= CALL_RING_FOCUS_GRACE {
+                let _ = handle.set_always_on_top(false);
+            }
+        }
+    });
+}
+
+/// Microfone, câmera, notificações e leitura da área de transferência são
+/// concedidos direto ao WhatsApp (sem o prompt do WebView2, como no app
+/// oficial); qualquer outra permissão, ou qualquer outro site, é negada.
+#[cfg(target_os = "windows")]
+fn grant_whatsapp_permissions(win: &tauri::WebviewWindow) {
+    let _ = win.with_webview(|webview| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+            COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+            COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+            COREWEBVIEW2_PERMISSION_STATE_DENY,
+        };
+        use webview2_com::{take_pwstr, PermissionRequestedEventHandler};
+        use windows::core::PWSTR;
+
+        let Ok(core) = webview.controller().CoreWebView2() else {
+            return;
+        };
+        let handler = PermissionRequestedEventHandler::create(Box::new(|_, args| {
+            let Some(args) = args else {
+                return Ok(());
+            };
+            let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+            args.PermissionKind(&mut kind)?;
+            let mut uri = PWSTR::null();
+            args.Uri(&mut uri)?;
+            let media_or_alerts = kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
+                || kind == COREWEBVIEW2_PERMISSION_KIND_CAMERA
+                || kind == COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS
+                || kind == COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ;
+            let state = if media_or_alerts && is_whatsapp_origin(&take_pwstr(uri)) {
+                COREWEBVIEW2_PERMISSION_STATE_ALLOW
+            } else {
+                COREWEBVIEW2_PERMISSION_STATE_DENY
+            };
+            args.SetState(state)
+        }));
+        let mut token = Default::default();
+        let _ = core.add_PermissionRequested(&handler, &mut token);
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn grant_whatsapp_permissions(_win: &tauri::WebviewWindow) {}
+
 fn allow_whatsapp_navigation(app: tauri::AppHandle, url: &tauri::Url) -> bool {
     match navigation_action(url) {
         NavigationAction::Allow => true,
@@ -2082,6 +2550,7 @@ fn create_main_window(
     let label = main_label(slug);
     let nav_app_handle = app.clone();
     let nav_label = label.clone();
+    let popup_app_handle = app.clone();
     // Com perfis em uso o nome vai no título: são duas sessões diferentes e
     // digitar na janela errada é fácil demais sem essa dica.
     let store = profiles::snapshot(app);
@@ -2115,7 +2584,8 @@ fn create_main_window(
             nav_app_handle.state::<RuntimeState>().page_loading(&nav_label);
         }
         allow_whatsapp_navigation(nav_app_handle.clone(), url)
-    });
+    })
+    .on_new_window(move |url, features| open_new_window(&popup_app_handle, url, features));
 
     // Sem perfis, `None`: o Tauri usa a pasta padrão dele e nada muda de lugar
     // pra quem nunca tocou no recurso.
@@ -2125,6 +2595,7 @@ fn create_main_window(
 
     let main_window = builder.build()?;
 
+    grant_whatsapp_permissions(&main_window);
     install_close_to_tray(&main_window);
     Ok(main_window)
 }
@@ -2580,6 +3051,7 @@ fn start_webview_maintenance(app: tauri::AppHandle) {
             let store = profiles::snapshot(&app);
             let expected = expected_main_windows(&store);
             let runtime = app.state::<RuntimeState>();
+            let call_window = call_window_open(&app);
 
             // Janelas que não deveriam mais existir: a do perfil anterior no
             // modo simples, ou os perfis de fundo quando o pré-carregado foi
@@ -2588,7 +3060,7 @@ fn start_webview_maintenance(app: tauri::AppHandle) {
                 if !is_main_label(&label) || expected.iter().any(|(l, _)| *l == label) {
                     continue;
                 }
-                if runtime.with_page(&label, |page| page.call_active) {
+                if call_window || runtime.with_page(&label, |page| page.call_active) {
                     continue;
                 }
                 let _ = win.destroy();
@@ -2651,7 +3123,7 @@ fn start_webview_maintenance(app: tauri::AppHandle) {
                             page.booted,
                             page.loaded_at,
                             page.retries,
-                            page.call_active,
+                            page.call_active || call_window,
                             page.heap_mb,
                         )
                     });
@@ -2659,7 +3131,7 @@ fn start_webview_maintenance(app: tauri::AppHandle) {
                 // Modo de baixo consumo enquanto escondido na bandeja/minimizado:
                 // devolve memória e desprioriza os processos do WebView2 pra não
                 // brigar por CPU com outros apps. Só aplica na transição.
-                let low = eco_wanted(hidden, warming, store.preload);
+                let low = eco_wanted(hidden, warming, store.preload, call_active);
                 if m.low_power != Some(low) {
                     apply_low_power_mode(&win, low);
                     m.low_power = Some(low);
@@ -2885,6 +3357,7 @@ pub fn run() {
             open_external_url,
             focus_main_window,
             send_notification,
+            close_notification,
             set_call_active,
             report_heap_mb,
             report_page_stage,
