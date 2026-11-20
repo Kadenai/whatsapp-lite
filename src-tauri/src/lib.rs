@@ -932,6 +932,12 @@ fn send_notification(
 mod tests {
     use super::*;
 
+    // Base dos testes bem no futuro: os testes subtraem intervalos de horas de `now`, e
+    // `Instant` não pode ficar antes do boot (a subtração entra em pânico com o PC ligado há pouco tempo).
+    fn test_now() -> Instant {
+        Instant::now() + Duration::from_secs(48 * 60 * 60)
+    }
+
     #[test]
     fn save_dialog_keeps_original_extension_when_user_deletes_it() {
         let path = keep_original_extension_if_missing(
@@ -957,7 +963,7 @@ mod tests {
 
     #[test]
     fn reload_waits_for_hidden_grace() {
-        let now = Instant::now();
+        let now = test_now();
         let last = past_min(now);
         let high_heap = HEAP_RELOAD_THRESHOLD_MB;
         // Escondida há pouco (179s < 3min): ainda não.
@@ -982,7 +988,7 @@ mod tests {
 
     #[test]
     fn reload_needs_longer_grace_when_visible_but_unfocused() {
-        let now = Instant::now();
+        let now = test_now();
         let last = past_min(now);
         let high_heap = HEAP_RELOAD_THRESHOLD_MB;
         // Sem foco há só 3min (grace de escondida): insuficiente pra janela visível.
@@ -1007,7 +1013,7 @@ mod tests {
 
     #[test]
     fn reload_never_runs_during_call() {
-        let now = Instant::now();
+        let now = test_now();
         assert!(!due_reload(
             now,
             now - RELOAD_MAX_INTERVAL,
@@ -1020,7 +1026,7 @@ mod tests {
 
     #[test]
     fn reload_respects_min_interval() {
-        let now = Instant::now();
+        let now = test_now();
         // Recarregou agora há pouco: nem heap alto força reload cedo demais.
         assert!(!due_reload(
             now,
@@ -1034,7 +1040,7 @@ mod tests {
 
     #[test]
     fn warming_ends_after_settle_or_cap() {
-        let now = Instant::now();
+        let now = test_now();
         // Carregando há pouco, sem sinal de pronto: aquecendo.
         assert!(page_warming(now, now - Duration::from_secs(30), None));
         // Pronto há pouco: ainda esperando a rajada do fim do sync.
@@ -1128,7 +1134,7 @@ mod tests {
 
     #[test]
     fn boot_retry_backs_off_and_stops_when_page_is_up() {
-        let now = Instant::now();
+        let now = test_now();
         let step0 = BOOT_RETRY_STEPS[0];
         assert!(!boot_retry_due(now, now - step0 + Duration::from_secs(1), false, 0));
         assert!(boot_retry_due(now, now - step0, false, 0));
@@ -1184,7 +1190,7 @@ mod tests {
 
     #[test]
     fn reload_skips_when_memory_ok_before_ceiling() {
-        let now = Instant::now();
+        let now = test_now();
         // Passou do mínimo, ocioso, mas heap baixo e ainda longe do teto: não recarrega.
         assert!(!due_reload(
             now,
@@ -1198,7 +1204,7 @@ mod tests {
 
     #[test]
     fn reload_ceiling_fires_without_memory_signal() {
-        let now = Instant::now();
+        let now = test_now();
         // Heap 0 (engine sem performance.memory) mas passou do teto de tempo: recarrega.
         assert!(due_reload(
             now,
@@ -1212,7 +1218,7 @@ mod tests {
 
     #[test]
     fn reload_needs_idle_even_under_memory_pressure() {
-        let now = Instant::now();
+        let now = test_now();
         // Heap altíssimo, passou do mínimo, mas usuário ativo (nada ocioso): não recarrega.
         assert!(!due_reload(
             now,
@@ -1551,6 +1557,16 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             })).catch((e) => console.error('[WhatsApp Lite] Falha ao silenciar:', e));
         };
 
+        // Chamado pelo Rust ao fechar a janela (X): fecha a conversa aberta, como
+        // o Esc, pra janela voltar sem conversa nenhuma aberta.
+        window.__waLiteCloseChat = function() {
+            const cmd = __waRequire('WAWebCmd');
+            if (cmd && cmd.Cmd && typeof cmd.Cmd.closeActiveChat === 'function') {
+                try { cmd.Cmd.closeActiveChat(); }
+                catch (e) { console.error('[WhatsApp Lite] Falha ao fechar a conversa:', e); }
+            }
+        };
+
         // === Guarda de chamada ativa ===
         // A manutenção no Rust recarrega a página quando o app fica muito tempo
         // aberto (o WhatsApp Web vaza memória e começa a travar). Recarregar no
@@ -1643,6 +1659,10 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             ].join(',');
             let __waBooted = false;
             const __waStartedAt = Date.now();
+            // O WhatsApp Web troca o clearInterval global pelo do agendador dele,
+            // que não conhece timers nativos: chamado depois, não parava nada e
+            // este timer rodava a cada 0,5 s pra sempre (com IPC a cada volta).
+            const clearInterval = window.clearInterval.bind(window);
             const __waStageTimer = setInterval(() => {
                 if (!__waBooted && document.getElementById('app')
                     && !document.getElementById('main-frame-error')) {
@@ -1725,8 +1745,13 @@ const WHATSAPP_PATCHES_JS: &str = r#"
                 if (window.__waLiteCallActive) return false;
                 if (!__waDndActive && !__waSilent) return false;
                 if (el.srcObject || el.muted) return false;
+                // O chime nunca é vídeo.
+                if (el instanceof HTMLVideoElement) return false;
                 const src = String(el.currentSrc || el.src || '');
                 if (src.startsWith('blob:')) return false;
+                // Mídia de conversa que o service worker transmite aos pedaços
+                // (/stream/video, /stream/audio) em vez de virar blob:.
+                if (src.startsWith(location.origin + '/stream/')) return false;
                 return __waSilent || !el.loop;
             };
 
@@ -2026,14 +2051,17 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             };
 
             const saveUrlToChosenPath = async (url, anchor, urlObj) => {
-                const suggested = inferFileNameFromAnchor(anchor, urlObj, null);
-                const selectedPath = await tauriInvoke('open_save_dialog', { suggestedName: suggested });
-                if (!selectedPath) return;
-
+                // Abre o arquivo ANTES do diálogo: o WhatsApp Web revoga o blob:
+                // logo depois do clique, enquanto o usuário ainda escolhe a pasta.
+                // A resposta já aberta segura o conteúdo mesmo com a URL revogada.
                 const response = await fetch(url, { credentials: 'include' });
                 if (!response.ok) {
                     throw new Error('Falha no download HTTP ' + response.status);
                 }
+
+                const suggested = inferFileNameFromAnchor(anchor, urlObj, null);
+                const selectedPath = await tauriInvoke('open_save_dialog', { suggestedName: suggested });
+                if (!selectedPath) return;
 
                 await tauriInvoke('prepare_binary_file', { path: selectedPath });
 
@@ -2155,6 +2183,133 @@ const WHATSAPP_PATCHES_JS: &str = r#"
             } catch (e) {
                 console.error('[WhatsApp Lite] Falha ao instalar hooks de location:', e);
             }
+        }
+
+        // === Papel de parede da conversa como bitmap ===
+        // O WhatsApp Web desenha os desenhos do fundo da conversa como máscara CSS de um SVG
+        // com centenas de traços, repetida no painel inteiro. A GPU redesenha esses traços
+        // durante a rolagem e a conversa cai para ~25 quadros/s (medido: ~100 ms por passo
+        // de rolagem, contra ~11 ms sem a máscara). Aqui o SVG vira, uma vez, um PNG com a
+        // mesma cor, tamanho e posição, aplicado como fundo comum. Qualquer falha deixa o
+        // fundo original do WhatsApp intocado.
+        const __waWallSel = '[data-testid^="conversation-background"]';
+        let __waWallKey = '';
+        let __waWallUrl = '';
+        let __waWallDpr = 0;
+        let __waWallStyle = null;
+
+        // Valores originais da máscara, com o nosso override desligado durante a leitura.
+        const __waWallRead = (el) => {
+            if (__waWallStyle) __waWallStyle.disabled = true;
+            try {
+                const s = getComputedStyle(el);
+                const m = /^url\("?([^")]+)"?\)$/.exec(s.maskImage || s.webkitMaskImage || 'none');
+                const mode = s.maskMode || 'match-source';
+                if (!m || (mode !== 'match-source' && mode !== 'alpha')) return null;
+                return {
+                    url: m[1],
+                    size: s.maskSize || s.webkitMaskSize,
+                    position: s.maskPosition || s.webkitMaskPosition,
+                    repeat: s.maskRepeat || s.webkitMaskRepeat,
+                    color: s.backgroundColor
+                };
+            } finally {
+                if (__waWallStyle) __waWallStyle.disabled = false;
+            }
+        };
+
+        const __waWallBuild = async (o, dpr) => {
+            const sz = /^([\d.]+)px ([\d.]+)px$/.exec(o.size || '');
+            if (!sz) return null;
+            const w = Math.round(parseFloat(sz[1]) * dpr);
+            const h = Math.round(parseFloat(sz[2]) * dpr);
+            const resp = await fetch(o.url, { mode: 'cors', credentials: 'omit' });
+            if (!resp.ok) return null;
+            const svgUrl = URL.createObjectURL(await resp.blob());
+            try {
+                const img = new Image();
+                img.src = svgUrl;
+                await img.decode();
+                const canvas = document.createElement('canvas');
+                canvas.width = w;
+                canvas.height = h;
+                const g = canvas.getContext('2d');
+                g.drawImage(img, 0, 0, w, h);
+                // A máscara usa só o alfa do SVG; a cor é o background-color do elemento.
+                g.globalCompositeOperation = 'source-in';
+                g.fillStyle = o.color;
+                g.fillRect(0, 0, w, h);
+                const png = await new Promise((res) => canvas.toBlob(res, 'image/png'));
+                return png ? URL.createObjectURL(png) : null;
+            } finally {
+                URL.revokeObjectURL(svgUrl);
+            }
+        };
+
+        const __waWallApply = (url, o) => {
+            if (!__waWallStyle) {
+                __waWallStyle = document.createElement('style');
+                __waWallStyle.id = 'wa-lite-wallpaper';
+                (document.head || document.documentElement).appendChild(__waWallStyle);
+            }
+            __waWallStyle.textContent = url ? (__waWallSel + ' {'
+                + '-webkit-mask-image: none !important;'
+                + 'mask-image: none !important;'
+                + 'background-color: transparent !important;'
+                + 'background-image: url("' + url + '") !important;'
+                + 'background-size: ' + o.size + ' !important;'
+                + 'background-position: ' + o.position + ' !important;'
+                + 'background-repeat: ' + o.repeat + ' !important;'
+                + '}') : '';
+            if (__waWallUrl && __waWallUrl !== url) URL.revokeObjectURL(__waWallUrl);
+            __waWallUrl = url || '';
+        };
+
+        const __waWallUpdate = async () => {
+            const el = document.querySelector(__waWallSel);
+            if (!el) return;
+            const o = __waWallRead(el);
+            const dpr = window.devicePixelRatio || 1;
+            __waWallDpr = dpr;
+            const key = o ? [o.url, o.size, o.position, o.repeat, o.color, dpr].join('|') : '';
+            if (key === __waWallKey) return;
+            __waWallKey = key;
+            if (!o) { __waWallApply('', null); return; } // sem desenhos no fundo: nada a trocar
+            let url = null;
+            try { url = await __waWallBuild(o, dpr); }
+            catch (e) { console.warn('[WhatsApp Lite] Fundo da conversa mantido como SVG:', e); }
+            if (__waWallKey !== key) { if (url) URL.revokeObjectURL(url); return; } // outra leitura passou na frente
+            if (!url) { __waWallKey = ''; __waWallApply('', null); return; } // tenta de novo na próxima conversa
+            __waWallApply(url, o);
+        };
+
+        // Este script roda antes de existir <html>: o que mexe no DOM espera o DOMContentLoaded.
+        const __waWallInstall = () => {
+            try {
+                // Detector barato do fundo aparecendo (abrir conversa): animação vazia + animationstart,
+                // em <style> separado do override para a leitura acima não disparar o detector.
+                const detector = document.createElement('style');
+                detector.textContent = '@keyframes waLiteWallSeen { from { --wa-lite-wall-seen: 1; } to { --wa-lite-wall-seen: 1; } }'
+                    + __waWallSel + ' { animation: waLiteWallSeen 1ms !important; }';
+                (document.head || document.documentElement).appendChild(detector);
+                document.addEventListener('animationstart', (e) => {
+                    if (e.animationName === 'waLiteWallSeen') __waWallUpdate();
+                }, true);
+                // Zoom muda a densidade de pixels: refaz o bitmap na resolução nova.
+                window.addEventListener('resize', () => {
+                    if (__waWallDpr && window.devicePixelRatio !== __waWallDpr) __waWallUpdate();
+                });
+                // Tema claro/escuro troca a classe do <body> e a cor dos desenhos.
+                new MutationObserver(() => __waWallUpdate())
+                    .observe(document.body, { attributes: true, attributeFilter: ['class'] });
+            } catch (e) {
+                console.error('[WhatsApp Lite] Falha ao preparar o fundo da conversa:', e);
+            }
+        };
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', __waWallInstall, { once: true });
+        } else {
+            __waWallInstall();
         }
 
         // Troca o banner "Baixar o WhatsApp" pela logo Lite. Sem rAF/setTimeout:
@@ -2284,6 +2439,10 @@ const WHATSAPP_PATCHES_JS: &str = r#"
         };
 
         new MutationObserver((mutations) => {
+            // O banner só existe na tela sem conversa aberta. Com conversa
+            // aberta (#main) nem olha: rolar pra cima insere lotes de mensagens
+            // e o textContent de cada lote custava CPU a cada rolagem.
+            if (document.getElementById('main')) return;
             if (__waMutationsHaveCandidate(mutations)) {
                 __waScheduleScan();
             }
@@ -2530,13 +2689,23 @@ fn allow_whatsapp_navigation(app: tauri::AppHandle, url: &tauri::Url) -> bool {
 fn install_close_to_tray(main_window: &tauri::WebviewWindow) {
     let win_handle = main_window.app_handle().clone();
     let label = main_window.label().to_string();
-    main_window.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { api, .. } = event {
+    main_window.on_window_event(move |event| match event {
+        WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             if let Some(win) = win_handle.get_webview_window(&label) {
+                let _ = win.eval("window.__waLiteCloseChat && window.__waLiteCloseChat();");
                 let _ = win.hide();
             }
         }
+        // Janela em foco nunca fica em modo econômico. Sem isto o EcoQoS e a
+        // memória enxugada duravam até a próxima volta da manutenção (até 10 s)
+        // depois de abrir pela bandeja, e rolar a conversa nesse meio travava.
+        WindowEvent::Focused(true) => {
+            if let Some(win) = win_handle.get_webview_window(&label) {
+                apply_low_power_mode(&win, false);
+            }
+        }
+        _ => {}
     });
 }
 

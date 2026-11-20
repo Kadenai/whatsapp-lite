@@ -23,6 +23,7 @@ Arquitetura resumida:
 - Tela de boas-vindas na primeira execucao: pergunta se o computador e
   compartilhado e, em caso positivo, cria o primeiro perfil ali mesmo.
 - Tray icon com menu (abrir/focar, perfis, autostart e sair).
+- Fechar a janela no X tambem fecha a conversa aberta, como Esc/Ctrl+W.
 - Autostart com Windows (inicializacao com --hidden).
 - Notificacoes nativas de nova mensagem (com foco/abertura da janela ao clicar no popup no Windows).
 - Regra para notificar somente quando a janela nao esta ativa.
@@ -37,8 +38,23 @@ Arquitetura resumida:
 	- Ctrl+Seta para cima para editar ultima mensagem enviada.
 - Chamadas de voz e video do WhatsApp Web: a janela da chamada abre como janela
   do app, e microfone/camera sao liberados so para o WhatsApp.
-- Download com dialogo nativo de salvar arquivo.
+- Download com dialogo nativo de salvar arquivo. O arquivo e aberto antes do
+  dialogo, entao o download nao se perde quando o WhatsApp Web descarta o link
+  temporario.
 - Abertura segura de links externos via sistema operacional.
+
+## Desempenho
+
+- Na bandeja ou minimizado, o WebView2 entra em modo economico (menos memoria e
+  prioridade baixa de CPU); ao focar a janela, volta ao normal na hora.
+- Rolagem da conversa tao fluida quanto a da lista de conversas. O WhatsApp Web
+  desenha os desenhos do fundo da conversa como mascara de um SVG com centenas
+  de tracos, e a GPU redesenhava esses tracos durante a rolagem. O app troca a
+  mascara por uma imagem pronta com a mesma cor, tamanho e posicao. Medido com
+  a roda do mouse: de ~100 ms para ~11 ms por passo de rolagem, e de ~130 para
+  ~600 quadros a cada 5 segundos.
+- Sem trabalho de fundo desnecessario durante a rolagem: os observadores do
+  patch nao reagem a cada lote de mensagens carregado.
 
 ## Tecnologias
 
@@ -115,7 +131,7 @@ Para conferir se o arquivo baixado bate com o release:
 
 ```powershell
 Get-FileHash .\WhatsAppLite.exe -Algorithm SHA256
-Get-FileHash .\WhatsAppLite_1.0.5_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\WhatsAppLite_1.2.1_x64-setup.exe -Algorithm SHA256
 ```
 
 No Linux:

@@ -9,7 +9,8 @@ WhatsApp Lite abre `https://web.whatsapp.com` em uma janela Tauri e adiciona int
 - atalhos de teclado;
 - bandeja do sistema;
 - abertura de links externos no navegador padrao;
-- remocao/substituicao do banner de download do WhatsApp Desktop.
+- remocao/substituicao do banner de download do WhatsApp Desktop;
+- ajustes locais de desempenho na pagina, como desenhar o fundo de desenhos da conversa como imagem equivalente (o SVG original vem do proprio `static.whatsapp.net`).
 
 ## O que este app nao faz
 
@@ -32,7 +33,7 @@ No PowerShell:
 
 ```powershell
 Get-FileHash .\WhatsAppLite.exe -Algorithm SHA256
-Get-FileHash .\WhatsAppLite_1.0.3_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\WhatsAppLite_1.2.1_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare os hashes com o arquivo `SHA256SUMS.txt`.
@@ -63,7 +64,8 @@ WhatsApp Lite opens `https://web.whatsapp.com` in a Tauri window and adds local 
 - keyboard shortcuts;
 - system tray;
 - external links opened in the default browser;
-- removal/replacement of the WhatsApp Desktop download banner.
+- removal/replacement of the WhatsApp Desktop download banner;
+- local performance tweaks to the page, such as drawing the chat doodle wallpaper as an equivalent image (the original SVG comes from WhatsApp's own `static.whatsapp.net`).
 
 ## What this app does not do
 
@@ -86,7 +88,7 @@ In PowerShell:
 
 ```powershell
 Get-FileHash .\WhatsAppLite.exe -Algorithm SHA256
-Get-FileHash .\WhatsAppLite_1.0.3_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\WhatsAppLite_1.2.1_x64-setup.exe -Algorithm SHA256
 ```
 
 Compare the hashes with `SHA256SUMS.txt`.
